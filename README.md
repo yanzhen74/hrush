@@ -115,6 +115,8 @@ Type a command after `:` and press `Enter`.
 | `:s/old/new` | Replace current match |
 | `:%s/old/new/g` | Replace all matches globally |
 
+> In `:s` and `:%s` commands, both `old` and `new` support hex patterns with the `x:` prefix (e.g., `:%s/x:DEAD/x:BEEF/g`). Without the prefix, the pattern is treated as ASCII text.
+
 ### Search Mode
 
 | Key | Action |

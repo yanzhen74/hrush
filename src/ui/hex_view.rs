@@ -61,12 +61,14 @@ pub fn draw(
         let base_offset = row * 16;
         let is_cursor_row = row == cursor_row;
         let base_bg = if is_cursor_row {
-            Some(Color::Rgb(50, 50, 50))
+            Some(Color::Indexed(240))
         } else {
             None
         };
-        let default_space_style = Style::default().bg(base_bg.unwrap_or(Color::Reset));
-        let default_empty_style = Style::default().bg(base_bg.unwrap_or(Color::Reset));
+        let default_space_style =
+            Style::default().fg(Color::White).bg(base_bg.unwrap_or(Color::Reset));
+        let default_empty_style =
+            Style::default().fg(Color::White).bg(base_bg.unwrap_or(Color::Reset));
 
         // Offset
         let offset_style =
@@ -92,9 +94,9 @@ pub fn draw(
                 let (hex_fg, hex_bg) = if is_cursor_byte && active_panel == Panel::Hex {
                     (Color::Black, Some(Color::White))
                 } else if is_current_match {
-                    (Color::White, Some(Color::Rgb(255, 165, 0)))
+                    (Color::White, Some(Color::Indexed(214)))
                 } else if is_search_match {
-                    (Color::White, Some(Color::Rgb(180, 100, 0)))
+                    (Color::White, Some(Color::Indexed(130)))
                 } else {
                     let fg = if is_modified { Color::Yellow } else { Color::White };
                     (fg, base_bg)
@@ -103,9 +105,9 @@ pub fn draw(
                 let (ascii_fg, ascii_bg) = if is_cursor_byte && active_panel == Panel::Ascii {
                     (Color::Black, Some(Color::White))
                 } else if is_current_match {
-                    (Color::White, Some(Color::Rgb(255, 165, 0)))
+                    (Color::White, Some(Color::Indexed(214)))
                 } else if is_search_match {
-                    (Color::White, Some(Color::Rgb(180, 100, 0)))
+                    (Color::White, Some(Color::Indexed(130)))
                 } else {
                     let fg = if is_modified { Color::Yellow } else { Color::White };
                     (fg, base_bg)

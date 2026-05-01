@@ -89,12 +89,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             app.search_state.clear();
         }
         KeyCode::Char('n') => {
-            if let Some(offset) = app.search_state.next_match(app.cursor_offset) {
+            let start = app.cursor_offset + 1;
+            if let Some(offset) = app.search_state.next_match(start) {
                 app.cursor_offset = offset;
             }
         }
         KeyCode::Char('N') => {
-            if let Some(offset) = app.search_state.prev_match(app.cursor_offset) {
+            let start = app.cursor_offset.saturating_sub(1);
+            if let Some(offset) = app.search_state.prev_match(start) {
                 app.cursor_offset = offset;
             }
         }

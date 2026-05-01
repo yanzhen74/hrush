@@ -118,11 +118,15 @@ fn parse_substitute(cmd: &str) -> Option<(bool, &str, &str)> {
     let old = &rest[..slash_idx];
     let new_and_flag = &rest[slash_idx + 1..];
 
-    let new = if new_and_flag.ends_with("/g") {
+    let has_g_flag = new_and_flag.ends_with("/g");
+    let new = if has_g_flag {
         &new_and_flag[..new_and_flag.len() - 2]
     } else {
         new_and_flag
     };
+
+    // :s/old/new/g 和 :%s/old/new/g 都视为全局替换（兼容 vim 习惯）
+    let global = global || has_g_flag;
 
     Some((global, old, new))
 }

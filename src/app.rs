@@ -70,12 +70,6 @@ impl App {
 
             let size = terminal.size()?;
             self.visible_rows = size.height.saturating_sub(4).max(1) as usize;
-            let cursor_row = self.cursor_offset / 16;
-            if cursor_row < self.scroll_offset {
-                self.scroll_offset = cursor_row;
-            } else if cursor_row >= self.scroll_offset + self.visible_rows {
-                self.scroll_offset = cursor_row.saturating_sub(self.visible_rows - 1);
-            }
 
             // 非 Insert 模式下光标不能超出缓冲区末尾
             if self.mode != Mode::Insert && !self.buffer.is_empty() && self.cursor_offset >= self.buffer.len() {
@@ -84,6 +78,14 @@ impl App {
 
             terminal.draw(|frame| ui::draw(frame, self))?;
             self.handle_events()?;
+
+            // 事件处理后再更新 scroll_offset，确保 cursor_offset 变化后立即同步
+            let cursor_row = self.cursor_offset / 16;
+            if cursor_row < self.scroll_offset {
+                self.scroll_offset = cursor_row;
+            } else if cursor_row >= self.scroll_offset + self.visible_rows.saturating_sub(1).max(1) {
+                self.scroll_offset = cursor_row.saturating_sub(self.visible_rows.saturating_sub(2).max(1));
+            }
         }
         Ok(())
     }
@@ -99,12 +101,6 @@ impl App {
 }
 
 pub fn run(file: Option<String>, import: Option<String>) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
     let mut app = App::new();
 
     if let Some(path) = file {
@@ -112,6 +108,12 @@ pub fn run(file: Option<String>, import: Option<String>) -> Result<()> {
     } else if let Some(path) = import {
         app.buffer = Buffer::from_hex_import(Path::new(&path))?;
     }
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
     let result = app.run(&mut terminal);
 

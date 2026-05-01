@@ -1,8 +1,19 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+
+/// 将单个 hex 字符转为 4-bit 值
+#[inline]
+fn hex_char_to_u8(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
 
 /// 解析 hex 文本文件，返回二进制数据
 ///
@@ -13,7 +24,8 @@ pub fn parse_hex_file(path: &Path) -> Result<Vec<u8>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read hex file: {}", path.display()))?;
 
-    let mut data = Vec::new();
+    // 预分配：文本中最多一半字符是有效 hex（另一半是空白/分隔符）
+    let mut data = Vec::with_capacity(content.len() / 2);
 
     for (line_num, line) in content.lines().enumerate() {
         let line_no = line_num + 1;
@@ -40,25 +52,26 @@ pub fn parse_hex_file(path: &Path) -> Result<Vec<u8>> {
                 );
             }
 
-            // 逐字节解析
-            for i in (0..chunk.len()).step_by(2) {
-                let byte_str = &chunk[i..i + 2];
-
-                // 检查非法字符（虽然 from_str_radix 也会报错，但我们想提供更精确的信息）
-                for c in byte_str.chars() {
-                    if !c.is_ascii_hexdigit() {
-                        anyhow::bail!(
-                            "Invalid hex character '{}' at line {} in chunk '{}'",
-                            c,
-                            line_no,
-                            chunk
-                        );
-                    }
-                }
-
-                let byte = u8::from_str_radix(byte_str, 16)
-                    .with_context(|| format!("Invalid hex byte '{}' at line {}", byte_str, line_no))?;
-                data.push(byte);
+            // 逐字节解析（直接操作 ASCII 字节，避免 from_str_radix 和 chars 迭代器开销）
+            let chunk_bytes = chunk.as_bytes();
+            for i in (0..chunk_bytes.len()).step_by(2) {
+                let hi = hex_char_to_u8(chunk_bytes[i]).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Invalid hex character '{}' at line {} in chunk '{}'",
+                        chunk_bytes[i] as char,
+                        line_no,
+                        chunk
+                    )
+                })?;
+                let lo = hex_char_to_u8(chunk_bytes[i + 1]).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Invalid hex character '{}' at line {} in chunk '{}'",
+                        chunk_bytes[i + 1] as char,
+                        line_no,
+                        chunk
+                    )
+                })?;
+                data.push((hi << 4) | lo);
             }
         }
     }
@@ -71,25 +84,26 @@ pub fn parse_hex_file(path: &Path) -> Result<Vec<u8>> {
 /// 每行输出 16 字节（32 个 hex 字符），空格分隔每 8 字节（16 个 hex 字符）。
 /// 大写 hex 字符，最后一行可能不足 16 字节。
 pub fn export_hex_file(data: &[u8], path: &Path) -> Result<()> {
-    let mut file = fs::File::create(path)
+    let file = fs::File::create(path)
         .with_context(|| format!("Failed to create hex export file: {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
 
     for (i, chunk) in data.chunks(16).enumerate() {
         if i > 0 {
-            writeln!(file)?;
+            writeln!(writer)?;
         }
 
         // 每 16 字节再按每 8 字节分组
         for (j, byte_chunk) in chunk.chunks(8).enumerate() {
             if j > 0 {
-                write!(file, " ")?;
+                write!(writer, " ")?;
             }
             for byte in byte_chunk {
-                write!(file, "{:02X}", byte)?;
+                write!(writer, "{:02X}", byte)?;
             }
         }
     }
-    writeln!(file)?;
+    writeln!(writer)?;
 
     Ok(())
 }
