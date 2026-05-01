@@ -44,6 +44,19 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(" [+]", Style::default().fg(Color::Yellow)));
     }
 
+    // 添加搜索匹配统计
+    if !app.search_state.matches.is_empty() {
+        spans.push(Span::raw(" | "));
+        let current = app.search_state.current_match
+            .map(|idx| idx + 1)  // 转为 1-based
+            .unwrap_or(0);
+        let total = app.search_state.matches.len();
+        spans.push(Span::styled(
+            format!("[{}/{}]", current, total),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
