@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{App, Mode};
+use crate::frame::FrameConfig;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let mode_text = match app.mode {
@@ -55,6 +56,29 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             format!("[{}/{}]", current, total),
             Style::default().fg(Color::Cyan),
         ));
+    }
+
+    // 帧模式下添加帧信息
+    if app.is_frame_mode() {
+        if let Some(frame_idx) = app.current_frame_number() {
+            let total = app.frame_index.as_ref().map(|fi| fi.frames.len()).unwrap_or(0);
+            let frame_info = if let Some(fi) = &app.frame_index {
+                match &fi.config {
+                    FrameConfig::FixedLength { length } => format!("len={}", length),
+                    FrameConfig::SyncWord { pattern } => {
+                        let pat_hex: String = pattern.iter().map(|b| format!("{:02X}", b)).collect();
+                        format!("sync={}", pat_hex)
+                    }
+                }
+            } else {
+                String::new()
+            };
+            spans.push(Span::raw(" | "));
+            spans.push(Span::styled(
+                format!("Frame {}/{} {}", frame_idx + 1, total, frame_info),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
     }
 
     let line = Line::from(spans);

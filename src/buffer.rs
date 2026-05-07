@@ -67,6 +67,10 @@ impl Buffer {
         self.data.is_empty()
     }
 
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn set_byte(&mut self, offset: usize, value: u8) {
         if let Some(byte) = self.data.get_mut(offset) {
             if *byte != value {
@@ -126,7 +130,7 @@ impl Buffer {
         self.dirty
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         match &self.source {
             FileSource::Binary(path) => {
                 fs::write(path, &self.data)
@@ -141,6 +145,8 @@ impl Buffer {
                 anyhow::bail!("Cannot save buffer with no file path. Use save_as instead.");
             }
         }
+        self.dirty = false;
+        self.modified.clear();
         Ok(())
     }
 
@@ -152,9 +158,11 @@ impl Buffer {
         }
     }
 
-    pub fn save_as(&self, path: &Path) -> Result<()> {
+    pub fn save_as(&mut self, path: &Path) -> Result<()> {
         fs::write(path, &self.data)
             .with_context(|| format!("Failed to save file: {}", path.display()))?;
+        self.dirty = false;
+        self.modified.clear();
         Ok(())
     }
 

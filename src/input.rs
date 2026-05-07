@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::app::{App, Mode};
 use crate::command;
 use crate::editor;
+use crate::frame::ViewMode;
 use crate::search;
 use crate::ui::Panel;
 
@@ -34,7 +35,21 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
     match pending {
         'g' => {
             if key.code == KeyCode::Char('g') {
-                app.cursor_offset = 0;
+                if app.is_frame_mode() {
+                    if let Some(fi) = &app.frame_index {
+                        if !fi.frames.is_empty() {
+                            let current_frame_num = app.current_frame_number().unwrap_or(0);
+                            let current_frame = &fi.frames[current_frame_num];
+                            let col = app.cursor_offset.saturating_sub(current_frame.offset);
+                            let first_frame = &fi.frames[0];
+                            let target_col = col.min(first_frame.length.saturating_sub(1));
+                            app.cursor_offset = first_frame.offset + target_col;
+                            app.scroll_offset = 0;
+                        }
+                    }
+                } else {
+                    app.cursor_offset = 0;
+                }
             } else {
                 // 不是 gg，将当前键作为普通键处理
                 handle_normal_mode(app, key);
@@ -55,6 +70,11 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent) {
+    // 帧模式下优先使用帧导航逻辑
+    if handle_frame_navigation(app, key) {
+        return;
+    }
+
     match key.code {
         // 多键命令前缀
         KeyCode::Char('g') => {
@@ -161,6 +181,21 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 Panel::Hex => Panel::Ascii,
                 Panel::Ascii => Panel::Hex,
             };
+        }
+
+        // F2 切换帧模式
+        KeyCode::F(2) => {
+            if app.is_frame_mode() {
+                // 切换回原始模式
+                app.view_mode = ViewMode::Raw;
+                app.h_scroll_offset = 0;
+            } else if app.frame_index.is_some() {
+                // 之前设置过帧参数，切换回帧模式
+                app.view_mode = ViewMode::Frame;
+            } else {
+                // 从未设置过帧参数
+                app.message = Some(("Use :frame len=N or :frame sync=XX to set frame mode first".to_string(), std::time::Instant::now()));
+            }
         }
 
         _ => {}
@@ -436,5 +471,170 @@ fn delete_line(app: &mut App) {
 fn clamp_cursor(app: &mut App) {
     if !app.buffer.is_empty() && app.cursor_offset >= app.buffer.len() {
         app.cursor_offset = app.buffer.len().saturating_sub(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 帧模式导航
+// ---------------------------------------------------------------------------
+
+fn handle_frame_navigation(app: &mut App, key: KeyEvent) -> bool {
+    if !app.is_frame_mode() {
+        return false;
+    }
+
+    let frame_index = match &app.frame_index {
+        Some(fi) => fi,
+        None => return false,
+    };
+
+    let current_frame_num = match app.current_frame_number() {
+        Some(n) => n,
+        None => return false,
+    };
+
+    let current_frame = &frame_index.frames[current_frame_num];
+
+    match key.code {
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let visible_bytes = app.visible_bytes.max(1);
+            let max_len = frame_index.frames.iter().map(|f| f.length).max().unwrap_or(0);
+            app.h_scroll_offset = (app.h_scroll_offset + visible_bytes).min(max_len.saturating_sub(1));
+            true
+        }
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let visible_bytes = app.visible_bytes.max(1);
+            app.h_scroll_offset = app.h_scroll_offset.saturating_sub(visible_bytes);
+            true
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            if app.cursor_offset > current_frame.offset {
+                app.cursor_offset -= 1;
+                sync_h_scroll(app);
+            }
+            true
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            let frame_end = current_frame.offset + current_frame.length.saturating_sub(1);
+            if app.cursor_offset < frame_end {
+                app.cursor_offset += 1;
+                sync_h_scroll(app);
+            }
+            true
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if current_frame_num + 1 < frame_index.frames.len() {
+                let col = app.cursor_offset.saturating_sub(current_frame.offset);
+                let next_frame = &frame_index.frames[current_frame_num + 1];
+                let next_col = col.min(next_frame.length.saturating_sub(1));
+                app.cursor_offset = next_frame.offset + next_col;
+                sync_v_scroll(app);
+            }
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if current_frame_num > 0 {
+                let col = app.cursor_offset.saturating_sub(current_frame.offset);
+                let prev_frame = &frame_index.frames[current_frame_num - 1];
+                let prev_col = col.min(prev_frame.length.saturating_sub(1));
+                app.cursor_offset = prev_frame.offset + prev_col;
+                sync_v_scroll(app);
+            }
+            true
+        }
+        KeyCode::Char('0') => {
+            app.cursor_offset = current_frame.offset;
+            app.h_scroll_offset = 0;
+            true
+        }
+        KeyCode::Char('$') => {
+            app.cursor_offset = current_frame.offset + current_frame.length.saturating_sub(1);
+            sync_h_scroll(app);
+            true
+        }
+        KeyCode::Char('G') => {
+            if !frame_index.frames.is_empty() {
+                let col = app.cursor_offset.saturating_sub(current_frame.offset);
+                let last_idx = frame_index.frames.len() - 1;
+                let last_frame = &frame_index.frames[last_idx];
+                let target_col = col.min(last_frame.length.saturating_sub(1));
+                app.cursor_offset = last_frame.offset + target_col;
+                sync_v_scroll(app);
+            }
+            true
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            frame_page_down(app);
+            true
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            frame_page_up(app);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn sync_v_scroll(app: &mut App) {
+    if let Some(frame_num) = app.current_frame_number() {
+        if frame_num < app.scroll_offset {
+            app.scroll_offset = frame_num;
+        } else if frame_num >= app.scroll_offset + app.visible_rows.saturating_sub(2).max(1) {
+            app.scroll_offset = frame_num.saturating_sub(app.visible_rows.saturating_sub(2).max(1));
+        }
+    }
+}
+
+fn sync_h_scroll(app: &mut App) {
+    if let Some(frame) = app.current_frame() {
+        let frame_col = app.cursor_offset.saturating_sub(frame.offset);
+        let visible_bytes = app.visible_bytes.max(1);
+        if frame_col < app.h_scroll_offset {
+            app.h_scroll_offset = frame_col;
+        } else if frame_col >= app.h_scroll_offset + visible_bytes {
+            app.h_scroll_offset = frame_col.saturating_sub(visible_bytes.saturating_sub(1));
+        }
+    }
+}
+
+fn frame_page_down(app: &mut App) {
+    let frame_index = match &app.frame_index {
+        Some(fi) => fi,
+        None => return,
+    };
+    let current_frame_num = match app.current_frame_number() {
+        Some(n) => n,
+        None => return,
+    };
+    let page_frames = app.visible_rows.saturating_sub(2).max(1);
+    let target_frame = (current_frame_num + page_frames).min(frame_index.frames.len().saturating_sub(1));
+    if target_frame != current_frame_num {
+        let current_frame = &frame_index.frames[current_frame_num];
+        let col = app.cursor_offset.saturating_sub(current_frame.offset);
+        let target = &frame_index.frames[target_frame];
+        let target_col = col.min(target.length.saturating_sub(1));
+        app.cursor_offset = target.offset + target_col;
+        sync_v_scroll(app);
+    }
+}
+
+fn frame_page_up(app: &mut App) {
+    let frame_index = match &app.frame_index {
+        Some(fi) => fi,
+        None => return,
+    };
+    let current_frame_num = match app.current_frame_number() {
+        Some(n) => n,
+        None => return,
+    };
+    let page_frames = app.visible_rows.saturating_sub(2).max(1);
+    let target_frame = current_frame_num.saturating_sub(page_frames);
+    if target_frame != current_frame_num {
+        let current_frame = &frame_index.frames[current_frame_num];
+        let col = app.cursor_offset.saturating_sub(current_frame.offset);
+        let target = &frame_index.frames[target_frame];
+        let target_col = col.min(target.length.saturating_sub(1));
+        app.cursor_offset = target.offset + target_col;
+        sync_v_scroll(app);
     }
 }

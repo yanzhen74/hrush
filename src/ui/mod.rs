@@ -6,6 +6,7 @@ use crate::app::App;
 mod command_line;
 mod hex_view;
 mod status_bar;
+pub mod frame_view;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Panel {
@@ -25,7 +26,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    {
+    if app.is_frame_mode() {
+        frame_view::render_frame_view(frame, layout[0], app);
+    } else {
         let buffer = &app.buffer;
         hex_view::draw(
             frame,

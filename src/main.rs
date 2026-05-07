@@ -11,6 +11,7 @@ mod large_file;
 mod ui;
 mod search;
 mod undo;
+mod frame;
 
 #[derive(Parser, Debug)]
 #[command(name = "hrush")]

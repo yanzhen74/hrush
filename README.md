@@ -14,6 +14,7 @@
 - **Search & Replace** — Supports both hex (`x:AABB`) and ASCII patterns, with global or single replacement.
 - **Multi-step Undo / Redo** — Grouped actions with automatic merge of adjacent edits.
 - **Hex Text Import / Export** — Import hex text files and save as binary; export binary to formatted hex text.
+- **Frame Mode** — Split files by fixed length (`:frame len=N`) or sync word (`:frame sync=XXYY`). Each frame is displayed on its own line with frame number, offset, and length. Full editing, undo/redo, and horizontal scrolling are supported.
 - **Modified Byte Highlighting** — Changed bytes are highlighted in yellow for easy tracking.
 
 ## Screenshot
@@ -70,6 +71,9 @@ hrush --import hex.txt
 | `$` | Go to end of line |
 | `Ctrl+F` | Page down |
 | `Ctrl+B` | Page up |
+| `F2` | Toggle Raw / Frame mode |
+| `Ctrl+Right` | Horizontal scroll right (Frame mode) |
+| `Ctrl+Left` | Horizontal scroll left (Frame mode) |
 | `i` | Enter Insert mode |
 | `r` | Single byte replace (next keystroke) |
 | `R` | Enter Replace mode |
@@ -109,7 +113,11 @@ Type a command after `:` and press `Enter`.
 | `:q` | Quit (fails if unsaved) |
 | `:q!` | Force quit without saving |
 | `:wq` | Save and quit |
+| `:w! [path]` | Force save (bypass fixed-length frame alignment warning) |
 | `:goto <offset>` | Jump to offset (decimal or `0x` hex) |
+| `:frame len=N` | Enable frame mode with fixed length N |
+| `:frame sync=XXYY` | Enable frame mode with sync word (hex) |
+| `:frame off` | Disable frame mode, return to raw view |
 | `:import <path>` | Import a hex text file |
 | `:export <path>` | Export current buffer as hex text |
 | `:s/old/new` | Replace current match |
@@ -155,6 +163,41 @@ EB 3C 90 4D 53 44 4F 53  35 2E 30
 ```
 
 > When imported, the file is saved as a `.bin` file with the same base name.
+
+## Frame Mode
+
+Frame mode splits the file into logical frames and displays one frame per line. This is useful for analyzing structured binary data such as telemetry packets or network frames.
+
+### Enabling Frame Mode
+
+- **Fixed length**: `:frame len=64` splits the file into 64-byte frames.
+- **Sync word**: `:frame sync=AABB` splits at each occurrence of the hex sync word `AABB`.
+- **Disable**: `:frame off` returns to the normal raw hex view.
+- **Quick toggle**: Press `F2` to switch between raw and frame mode.
+
+### Frame Mode Display
+
+Each line shows:
+- `#NNNN` — Frame number (1-based)
+- `@XXXXXXXX` — File offset of the frame start
+- `LXXXX` — Frame length in bytes
+- Horizontal coordinate ruler (`00 01 02 ...`) for byte position within the frame
+
+### Frame Mode Navigation
+
+All normal-mode navigation keys work in frame mode:
+- `h`/`l`/`j`/`k` — Move within/across frames
+- `0` / `$` — Start / end of current frame
+- `gg` / `G` — First / last frame
+- `Ctrl+F` / `Ctrl+B` — Page down / up
+- `Ctrl+Right` / `Ctrl+Left` — Horizontal scroll by one screen width
+
+### Editing in Frame Mode
+
+- Insert (`i`) and Replace (`R`) work exactly as in raw mode.
+- Undo (`u`) / Redo (`Ctrl+R`) are fully supported.
+- After each edit, the frame index is automatically rebuilt so frame boundaries stay correct.
+- **Caveat**: In fixed-length mode, if your edits change the total file size so it is no longer a multiple of the frame length, `:w` will warn you. Use `:w!` to force save anyway.
 
 ## License
 

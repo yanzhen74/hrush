@@ -1,6 +1,15 @@
 use crate::app::App;
 use crate::undo::{ActionType, EditAction};
 
+/// 编辑后根据需要重建帧索引
+fn sync_frame_index(app: &mut App) {
+    if app.is_frame_mode() {
+        if let Some(ref mut frame_index) = app.frame_index {
+            crate::frame::rebuild_frame_index(frame_index, app.buffer.data());
+        }
+    }
+}
+
 /// 覆盖字节，记录 undo
 pub fn set_byte(app: &mut App, offset: usize, value: u8) {
     if let Some(old) = app.buffer.get_byte(offset) {
@@ -10,6 +19,7 @@ pub fn set_byte(app: &mut App, offset: usize, value: u8) {
             app.undo_manager.record(action);
         }
     }
+    sync_frame_index(app);
 }
 
 /// 插入字节，记录 undo
@@ -17,6 +27,7 @@ pub fn insert_byte(app: &mut App, offset: usize, value: u8) {
     let action = EditAction::insert_byte(offset, value);
     app.buffer.insert_byte(offset, value);
     app.undo_manager.record(action);
+    sync_frame_index(app);
 }
 
 /// 删除字节，记录 undo
@@ -25,6 +36,7 @@ pub fn remove_byte(app: &mut App, offset: usize) {
         let action = EditAction::remove_byte(offset, old);
         app.undo_manager.record(action);
     }
+    sync_frame_index(app);
 }
 
 /// 执行撤销
@@ -54,6 +66,7 @@ pub fn undo(app: &mut App) {
                 }
             }
         }
+        sync_frame_index(app);
     }
 }
 
@@ -84,5 +97,6 @@ pub fn redo(app: &mut App) {
                 }
             }
         }
+        sync_frame_index(app);
     }
 }

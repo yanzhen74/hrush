@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::app::App;
 use crate::buffer::FileSource;
+use crate::frame::{ViewMode, FrameConfig, build_frame_index};
 use crate::import;
 use crate::search::{self, SearchPattern};
 
@@ -19,6 +20,10 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
 
     match command {
         "w" => {
+            if let Some(msg) = check_frame_length(app) {
+                app.message = Some((msg, Instant::now()));
+                return Ok(());
+            }
             if parts.len() >= 2 {
                 let path = parts[1];
                 app.buffer.save_as(Path::new(path))?;
@@ -43,7 +48,23 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         "q!" => {
             app.running = false;
         }
+        "w!" => {
+            if parts.len() >= 2 {
+                let path = parts[1];
+                app.buffer.save_as(Path::new(path))?;
+                app.buffer
+                    .set_source(FileSource::Binary(std::path::PathBuf::from(path)));
+                app.message = Some((format!("Saved as {}", path), Instant::now()));
+            } else {
+                app.buffer.save()?;
+                app.message = Some(("Saved".to_string(), Instant::now()));
+            }
+        }
         "wq" => {
+            if let Some(msg) = check_frame_length(app) {
+                app.message = Some((msg, Instant::now()));
+                return Ok(());
+            }
             app.buffer.save()?;
             app.running = false;
         }
@@ -74,6 +95,56 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
                 app.cursor_offset = offset.min(app.buffer.len().saturating_sub(1));
             }
         }
+        "frame" => {
+            if parts.len() >= 2 {
+                let arg = parts[1];
+                if arg == "off" {
+                    app.view_mode = ViewMode::Raw;
+                    app.frame_index = None;
+                    app.frame_original_len = None;
+                    app.h_scroll_offset = 0;
+                    app.message = Some(("Frame mode off".to_string(), Instant::now()));
+                } else if let Some(rest) = arg.strip_prefix("len=") {
+                    match parse_offset(rest) {
+                        Ok(length) => {
+                            if length > 0 {
+                                let config = FrameConfig::FixedLength { length };
+                                let index = build_frame_index(app.buffer.data(), &config);
+                                app.frame_index = Some(index);
+                                app.frame_original_len = Some(app.buffer.len());
+                                app.view_mode = ViewMode::Frame;
+                                app.message = Some((format!("Frame mode: fixed length {}", length), Instant::now()));
+                            } else {
+                                app.message = Some(("Frame length must be > 0".to_string(), Instant::now()));
+                            }
+                        }
+                        Err(e) => {
+                            app.message = Some((format!("Invalid frame length: {}", e), Instant::now()));
+                        }
+                    }
+                } else if let Some(rest) = arg.strip_prefix("sync=") {
+                    match parse_hex_bytes(rest) {
+                        Ok(pattern) if !pattern.is_empty() => {
+                            let config = FrameConfig::SyncWord { pattern };
+                            let index = build_frame_index(app.buffer.data(), &config);
+                            app.frame_index = Some(index);
+                            app.view_mode = ViewMode::Frame;
+                            app.message = Some(("Frame mode: sync word".to_string(), Instant::now()));
+                        }
+                        Ok(_) => {
+                            app.message = Some(("Sync word pattern must not be empty".to_string(), Instant::now()));
+                        }
+                        Err(e) => {
+                            app.message = Some((format!("Invalid sync word: {}", e), Instant::now()));
+                        }
+                    }
+                } else {
+                    app.message = Some((format!("Unknown frame argument: {}", arg), Instant::now()));
+                }
+            } else {
+                app.message = Some(("Usage: :frame len=N | :frame sync=HEX | :frame off".to_string(), Instant::now()));
+            }
+        }
         _ => {
             // 尝试解析为替换命令 :s/old/new 或 :%s/old/new/g
             if let Some((global, old, new)) = parse_substitute(trimmed) {
@@ -92,6 +163,29 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 检查固定长度帧模式下 buffer 长度是否发生变化
+/// 如果发生变化，返回警告消息；否则返回 None
+fn check_frame_length(app: &App) -> Option<String> {
+    let is_fixed_length = app
+        .frame_index
+        .as_ref()
+        .map(|fi| matches!(fi.config, FrameConfig::FixedLength { .. }))
+        .unwrap_or(false);
+    if !is_fixed_length {
+        return None;
+    }
+    if let Some(original_len) = app.frame_original_len {
+        let current_len = app.buffer.len();
+        if current_len != original_len {
+            return Some(format!(
+                "Length changed (was {}, now {}). Use :w! to force save",
+                original_len, current_len
+            ));
+        }
+    }
+    None
 }
 
 fn parse_offset(s: &str) -> Result<usize> {
@@ -163,4 +257,21 @@ fn patterns_equal(a: &SearchPattern, b: &SearchPattern) -> bool {
         (SearchPattern::Ascii(a), SearchPattern::Ascii(b)) => a == b,
         _ => false,
     }
+}
+
+fn parse_hex_bytes(hex_str: &str) -> Result<Vec<u8>> {
+    let cleaned: String = hex_str.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        bail!("Empty hex string");
+    }
+    if cleaned.len() % 2 != 0 {
+        bail!("Hex string must have even number of digits");
+    }
+    let mut bytes = Vec::with_capacity(cleaned.len() / 2);
+    for i in (0..cleaned.len()).step_by(2) {
+        let byte = u8::from_str_radix(&cleaned[i..i + 2], 16)
+            .map_err(|e| anyhow::anyhow!("Invalid hex byte: {}", e))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
 }
