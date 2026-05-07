@@ -500,11 +500,16 @@ fn handle_frame_navigation(app: &mut App, key: KeyEvent) -> bool {
             let visible_bytes = app.visible_bytes.max(1);
             let max_len = frame_index.frames.iter().map(|f| f.length).max().unwrap_or(0);
             app.h_scroll_offset = (app.h_scroll_offset + visible_bytes).min(max_len.saturating_sub(1));
+            // 同时将光标移动到新可视区域的第一个字节，避免被同步逻辑拉回
+            app.cursor_offset = current_frame.offset + app.h_scroll_offset;
             true
         }
         KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let visible_bytes = app.visible_bytes.max(1);
             app.h_scroll_offset = app.h_scroll_offset.saturating_sub(visible_bytes);
+            // 同时将光标移动到新可视区域的最后一个字节，避免被同步逻辑拉回
+            let frame_col = app.h_scroll_offset + visible_bytes.saturating_sub(1);
+            app.cursor_offset = current_frame.offset + frame_col.min(current_frame.length.saturating_sub(1));
             true
         }
         KeyCode::Char('h') | KeyCode::Left => {
