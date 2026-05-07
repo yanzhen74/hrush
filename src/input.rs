@@ -584,8 +584,8 @@ fn sync_v_scroll(app: &mut App) {
     if let Some(frame_num) = app.current_frame_number() {
         if frame_num < app.scroll_offset {
             app.scroll_offset = frame_num;
-        } else if frame_num >= app.scroll_offset + app.visible_rows.saturating_sub(2).max(1) {
-            app.scroll_offset = frame_num.saturating_sub(app.visible_rows.saturating_sub(2).max(1));
+        } else if frame_num >= app.scroll_offset + (app.visible_rows.saturating_sub(2).max(1)).saturating_sub(1).max(1) {
+            app.scroll_offset = frame_num.saturating_sub((app.visible_rows.saturating_sub(2).max(1)).saturating_sub(1).max(1));
         }
     }
 }

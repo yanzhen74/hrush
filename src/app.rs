@@ -107,8 +107,8 @@ impl App {
                 if let Some(frame_num) = self.current_frame_number() {
                     if frame_num < self.scroll_offset {
                         self.scroll_offset = frame_num;
-                    } else if frame_num >= self.scroll_offset + self.visible_rows.saturating_sub(2).max(1) {
-                        self.scroll_offset = frame_num.saturating_sub(self.visible_rows.saturating_sub(2).max(1));
+                    } else if frame_num >= self.scroll_offset + (self.visible_rows.saturating_sub(2).max(1)).saturating_sub(1).max(1) {
+                        self.scroll_offset = frame_num.saturating_sub((self.visible_rows.saturating_sub(2).max(1)).saturating_sub(1).max(1));
                     }
                 }
                 // 帧模式：水平滚动确保光标字节可见
