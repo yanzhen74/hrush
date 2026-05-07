@@ -48,7 +48,7 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
 
     let visible_rows = inner.height as usize;
     let start_frame = app.scroll_offset.min(total_frames.saturating_sub(1));
-    let end_frame = (start_frame + visible_rows.saturating_sub(1)).min(total_frames);
+    let end_frame = (start_frame + visible_rows.saturating_sub(2)).min(total_frames);
 
     // 光标所在帧索引
     let cursor_frame_idx = app.current_frame_number();
@@ -58,21 +58,48 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
 
     let mut lines = Vec::new();
 
-    // Header row（坐标尺）
-    let mut header_spans = Vec::new();
-    header_spans.push(Span::styled(
-        " ".repeat(header_width as usize),
-        Style::default().fg(Color::Gray),
-    ));
+    let data_chars_len = if visible_bytes == 0 { 0 } else { visible_bytes * 3 - 1 };
+
+    // 第一行：刻度线
+    let mut tick_line = " ".repeat(header_width as usize);
     for i in 0..visible_bytes {
         let byte_idx = app.h_scroll_offset + i;
-        let sep = if i + 1 < visible_bytes { " " } else { "" };
-        header_spans.push(Span::styled(
-            format!("{:02X}{}", byte_idx % 256, sep),
-            Style::default().fg(Color::Gray),
-        ));
+        let mark = if byte_idx % 10 == 0 {
+            "|"
+        } else if byte_idx % 5 == 0 {
+            ":"
+        } else {
+            "."
+        };
+        tick_line.push_str(mark);
+        if i + 1 < visible_bytes {
+            tick_line.push_str("  ");
+        }
     }
-    lines.push(Line::from(header_spans));
+    lines.push(Line::from(Span::styled(
+        tick_line,
+        Style::default().fg(Color::Gray),
+    )));
+
+    // 第二行：数字
+    let mut num_chars = vec![' '; data_chars_len];
+    for i in 0..visible_bytes {
+        let byte_idx = app.h_scroll_offset + i;
+        if byte_idx % 10 == 0 {
+            let start_pos = i * 3;
+            let num_str = byte_idx.to_string();
+            for (j, c) in num_str.chars().enumerate() {
+                if start_pos + j < data_chars_len {
+                    num_chars[start_pos + j] = c;
+                }
+            }
+        }
+    }
+    let num_line = " ".repeat(header_width as usize) + &num_chars.into_iter().collect::<String>();
+    lines.push(Line::from(Span::styled(
+        num_line,
+        Style::default().fg(Color::Gray),
+    )));
 
     // Frame rows
     for frame_idx in start_frame..end_frame {

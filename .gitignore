@@ -1,2 +1,4 @@
 /target
 /.cargo_home
+/release
+/.tmp-win7
