@@ -44,6 +44,7 @@ pub struct App {
     pub h_scroll_offset: usize,
     pub frame_original_len: Option<usize>,
     pub visible_bytes: usize,
+    pub insert_after: bool,
 }
 
 impl App {
@@ -68,6 +69,7 @@ impl App {
             h_scroll_offset: 0,
             frame_original_len: None,
             visible_bytes: 0,
+            insert_after: false,
         }
     }
 
@@ -98,6 +100,18 @@ impl App {
                 self.cursor_offset = self.buffer.len().saturating_sub(1);
             }
 
+            // 检查异步搜索是否完成
+            if self.search_state.poll_result() {
+                // 搜索完成，自动跳转到第一个匹配
+                if let Some(offset) = self.search_state.first_match() {
+                    self.cursor_offset = offset;
+                } else if !self.search_state.matches.is_empty() {
+                    if let Some(offset) = self.search_state.next_match(self.cursor_offset) {
+                        self.cursor_offset = offset;
+                    }
+                }
+            }
+            
             terminal.draw(|frame| ui::draw(frame, self))?;
             self.handle_events()?;
 
@@ -131,6 +145,11 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// 是否有异步搜索正在执行
+    pub fn is_searching(&self) -> bool {
+        self.search_state.is_searching()
     }
 
     /// 是否处于帧模式

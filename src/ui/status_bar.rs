@@ -45,8 +45,29 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(" [+]", Style::default().fg(Color::Yellow)));
     }
 
-    // 添加搜索匹配统计
-    if !app.search_state.matches.is_empty() {
+    if app.is_searching() {
+        let progress = app.search_state.progress.lock().unwrap();
+        let pct = if progress.total > 0 {
+            (progress.scanned as f64 / progress.total as f64 * 100.0) as u8
+        } else {
+            0
+        };
+        let bar_width = 20;
+        let filled = (pct as usize * bar_width) / 100;
+        let bar = format!(
+            "[{}{}] {}% ({} matches)",
+            "\u{2588}".repeat(filled),
+            "\u{2591}".repeat(bar_width - filled),
+            pct,
+            progress.matches_found
+        );
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            bar,
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if !app.search_state.matches.is_empty() {
+        // 搜索完成后显示匹配统计
         spans.push(Span::raw(" | "));
         let current = app.search_state.current_match
             .map(|idx| idx + 1)  // 转为 1-based

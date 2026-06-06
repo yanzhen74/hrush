@@ -239,7 +239,19 @@ fn execute_substitute(app: &mut App, global: bool, old: &str, new: &str) -> Resu
         });
 
         if need_search {
-            app.search_state.search(&app.buffer, old_pat.clone());
+            let data = app.buffer.data().to_vec();
+            app.search_state.start_search(data, old_pat.clone());
+            // 对于替换操作，需要等待搜索完成后才能替换
+            // 等待异步搜索完成（最多等待 5 秒）
+            let wait_start = std::time::Instant::now();
+            while app.search_state.is_searching() {
+                if wait_start.elapsed() > std::time::Duration::from_secs(5) {
+                    app.search_state.cancel();
+                    anyhow::bail!("Search timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            app.search_state.poll_result();
             // 选中从当前光标开始的第一个匹配
             if let Some(offset) = app.search_state.next_match(app.cursor_offset) {
                 app.cursor_offset = offset;

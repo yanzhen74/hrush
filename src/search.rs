@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::thread::{self, JoinHandle};
+
 use crate::app::App;
-use crate::buffer::Buffer;
 use crate::editor;
 
 #[derive(Clone, Debug)]
@@ -27,10 +29,22 @@ impl SearchPattern {
     }
 }
 
+pub struct SearchProgress {
+    pub scanned: usize,
+    pub total: usize,
+    pub matches_found: usize,
+    pub done: bool,
+    pub cancelled: bool,
+}
+
 pub struct SearchState {
     pub pattern: Option<SearchPattern>,
     pub matches: Vec<usize>,
     pub current_match: Option<usize>,
+    // 异步搜索字段
+    pub progress: Arc<Mutex<SearchProgress>>,
+    pub cancel_flag: Arc<AtomicBool>,
+    pub search_handle: Option<JoinHandle<Vec<usize>>>,
 }
 
 impl SearchState {
@@ -39,33 +53,129 @@ impl SearchState {
             pattern: None,
             matches: Vec::new(),
             current_match: None,
+            progress: Arc::new(Mutex::new(SearchProgress {
+                scanned: 0,
+                total: 0,
+                matches_found: 0,
+                done: false,
+                cancelled: false,
+            })),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            search_handle: None,
         }
     }
 
-    pub fn search(&mut self, buffer: &Buffer, pattern: SearchPattern) {
+    /// 启动后台线程搜索
+    pub fn start_search(&mut self, data: Vec<u8>, pattern: SearchPattern) {
         self.clear();
+
         let pat_len = pattern.len();
-        if pat_len == 0 {
+        if pat_len == 0 || pat_len > data.len() {
             self.pattern = Some(pattern);
             return;
         }
+
+        self.pattern = Some(pattern.clone());
 
         let pat_bytes: Vec<u8> = pattern.as_bytes().to_vec();
-        let buf_len = buffer.len();
+        let total = if data.len() >= pat_len {
+            data.len() - pat_len + 1
+        } else {
+            0
+        };
 
-        if pat_len > buf_len {
-            self.pattern = Some(pattern);
-            return;
-        }
+        // 为本次搜索创建全新的进度与取消标志
+        self.progress = Arc::new(Mutex::new(SearchProgress {
+            scanned: 0,
+            total,
+            matches_found: 0,
+            done: false,
+            cancelled: false,
+        }));
+        self.cancel_flag = Arc::new(AtomicBool::new(false));
 
-        for i in 0..=buf_len - pat_len {
-            let window = buffer.get_range(i, pat_len);
-            if window == pat_bytes.as_slice() {
-                self.matches.push(i);
+        let progress = Arc::clone(&self.progress);
+        let cancel_flag = Arc::clone(&self.cancel_flag);
+
+        let handle = thread::spawn(move || {
+            let mut matches = Vec::new();
+            let data_len = data.len();
+
+            for i in 0..=(data_len - pat_len) {
+                // 检查取消标志
+                if cancel_flag.load(Ordering::SeqCst) {
+                    let mut p = progress.lock().unwrap();
+                    p.cancelled = true;
+                    p.done = true;
+                    return matches;
+                }
+
+                // 线性匹配
+                if data[i..].starts_with(&pat_bytes) {
+                    matches.push(i);
+                }
+
+                // 每 4096 字节更新一次进度
+                if i % 4096 == 0 {
+                    let mut p = progress.lock().unwrap();
+                    p.scanned = i + 1;
+                    p.matches_found = matches.len();
+                }
+            }
+
+            // 最终更新进度
+            {
+                let mut p = progress.lock().unwrap();
+                p.scanned = total;
+                p.matches_found = matches.len();
+                p.done = true;
+            }
+
+            matches
+        });
+
+        self.search_handle = Some(handle);
+    }
+
+    /// 检查线程是否完成，收集结果到 self.matches
+    /// 返回 true 表示搜索刚刚完成（本次调用收集了结果）
+    pub fn poll_result(&mut self) -> bool {
+        if let Some(handle) = self.search_handle.take() {
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(result_matches) => {
+                        self.matches = result_matches;
+                    }
+                    Err(_) => {
+                        self.matches.clear();
+                    }
+                }
+                return true;
+            } else {
+                // 线程还没完成，放回 handle
+                self.search_handle = Some(handle);
             }
         }
+        false
+    }
 
-        self.pattern = Some(pattern);
+    /// 设置取消标志
+    pub fn cancel(&self) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// 判断当前是否有搜索在执行
+    pub fn is_searching(&self) -> bool {
+        if let Some(ref handle) = self.search_handle {
+            !handle.is_finished()
+        } else {
+            false
+        }
+    }
+
+    /// 获取第一个匹配偏移
+    pub fn first_match(&self) -> Option<usize> {
+        self.matches.first().copied()
     }
 
     pub fn next_match(&mut self, cursor: usize) -> Option<usize> {
@@ -102,9 +212,33 @@ impl SearchState {
     }
 
     pub fn clear(&mut self) {
+        // 如果有正在进行的搜索，先取消
+        if self.is_searching() {
+            self.cancel_flag.store(true, Ordering::SeqCst);
+        }
+        // 等待线程结束（非阻塞地尝试 join）
+        if let Some(handle) = self.search_handle.take() {
+            // 如果线程已完成则 join 丢弃结果，否则放弃 handle 让线程自行结束
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+            // 如果线程未完成，handle 被 drop 会导致 detach，
+            // 但 cancel_flag 已设置，线程很快会自行退出
+        }
+
         self.pattern = None;
         self.matches.clear();
         self.current_match = None;
+
+        // 重置进度
+        {
+            let mut progress = self.progress.lock().unwrap();
+            progress.scanned = 0;
+            progress.total = 0;
+            progress.matches_found = 0;
+            progress.done = false;
+            progress.cancelled = false;
+        }
     }
 
     pub fn current_match_offset(&self) -> Option<usize> {

@@ -18,6 +18,12 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 搜索进行中时，Esc 优先中断搜索
+    if key.code == KeyCode::Esc && app.is_searching() {
+        app.search_state.cancel();
+        return Ok(());
+    }
+
     match app.mode {
         Mode::Normal => handle_normal_mode(app, key),
         Mode::Insert => handle_insert_mode(app, key),
@@ -91,7 +97,16 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // 模式切换
         KeyCode::Char('i') => {
             app.mode = Mode::Insert;
+            app.insert_after = false;
             app.nibble_input = None;
+        }
+        KeyCode::Char('a') => {
+            app.mode = Mode::Insert;
+            app.insert_after = true;
+            app.nibble_input = None;
+            if !app.buffer.is_empty() {
+                app.cursor_offset = (app.cursor_offset + 1).min(app.buffer.len());
+            }
         }
         KeyCode::Char('R') => {
             app.mode = Mode::Replace;
@@ -206,6 +221,7 @@ fn handle_insert_mode(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.mode = Mode::Normal;
+            app.insert_after = false;
             app.nibble_input = None;
             clamp_cursor(app);
         }
@@ -235,10 +251,8 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
             let input = app.search_input.clone();
             match search::parse_pattern(&input) {
                 Ok(pattern) => {
-                    app.search_state.search(&app.buffer, pattern);
-                    if let Some(offset) = app.search_state.next_match(app.cursor_offset) {
-                        app.cursor_offset = offset;
-                    }
+                    let data = app.buffer.data().to_vec();
+                    app.search_state.start_search(data, pattern);
                 }
                 Err(e) => {
                     app.message = Some((format!("Search error: {}", e), std::time::Instant::now()));
