@@ -16,6 +16,8 @@
 - **Hex Text Import / Export** — Import hex text files and save as binary; export binary to formatted hex text.
 - **Frame Mode** — Split files by fixed length (`:frame len=N`) or sync word (`:frame sync=XXYY`). Each frame is displayed on its own line with frame number, offset, and length. Full editing, undo/redo, and horizontal scrolling are supported.
 - **Modified Byte Highlighting** — Changed bytes are highlighted in yellow for easy tracking.
+- **Append Insert (`a`)** — Press `a` to insert after cursor, just like Vim's append mode.
+- **Search Progress Bar** — Async search with real-time progress display (percentage + match count), cancelable with `Esc`.
 
 ## Screenshot
 
@@ -75,6 +77,7 @@ hrush --import hex.txt
 | `Ctrl+Right` | Horizontal scroll right (Frame mode) |
 | `Ctrl+Left` | Horizontal scroll left (Frame mode) |
 | `i` | Enter Insert mode |
+| `a` | Append after cursor (Insert mode) |
 | `r` | Single byte replace (next keystroke) |
 | `R` | Enter Replace mode |
 | `x` | Delete byte at cursor |
@@ -134,6 +137,8 @@ Type a command after `:` and press `Enter`.
 | `Esc` | Cancel search and return to Normal mode |
 
 > Search patterns starting with `x:` are treated as hex (e.g., `x:DEADBEEF`). Otherwise the pattern is treated as ASCII.
+
+> For large files, a progress bar is displayed in the status bar during search. Press `Esc` to cancel an ongoing search.
 
 ## Command Reference
 
