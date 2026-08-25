@@ -31,6 +31,7 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
         Mode::Command => handle_command_mode(app, key),
         Mode::Search => handle_search_mode(app, key),
         Mode::Visual => handle_visual_mode(app, key),
+        Mode::Help => handle_help_mode(app, key)
     }
 
     Ok(())
@@ -109,6 +110,18 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.pending_key = Some('r');
             app.nibble_input = None;
+        }
+
+        // 帮助模式入口
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.help_topic = None;
+            app.mode = Mode::Help;
+        }
+        KeyCode::F(1) => {
+            app.help_scroll = 0;
+            app.help_topic = None;
+            app.mode = Mode::Help;
         }
 
         // 模式切换
@@ -267,6 +280,45 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
     // 未提前 return 的动作执行完后清除 count 前缀
     app.count_prefix = None;
+}
+
+fn handle_help_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.help_scroll += 1;
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+        }
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.help_scroll += 20;
+        }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.help_scroll = app.help_scroll.saturating_sub(20);
+        }
+        KeyCode::PageDown => {
+            app.help_scroll += 20;
+        }
+        KeyCode::PageUp => {
+            app.help_scroll = app.help_scroll.saturating_sub(20);
+        }
+        KeyCode::Char('g') => {
+            // pending_key 逻辑: g + g 跳转到顶部
+            if app.pending_key == Some('g') {
+                app.pending_key = None;
+                app.help_scroll = 0;
+            } else {
+                app.pending_key = Some('g');
+            }
+        }
+        KeyCode::Char('G') => {
+            app.help_scroll = 9999;
+        }
+        _ => {}
+    }
 }
 
 fn handle_visual_mode(app: &mut App, key: KeyEvent) {

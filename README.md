@@ -9,7 +9,7 @@
 
 - **High Performance** — Written in Rust with memory-mapped file support (`mmap`) for large files.
 - **Vi-style Key Bindings** — Familiar `hjkl` navigation and modal editing for power users.
-- **Six Modes** — Normal / Insert / Replace / Visual / Command / Search.
+- **Seven Modes** — Normal / Insert / Replace / Visual / Command / Search / Help.
 - **Dual-panel Editing** — Hex and ASCII views side-by-side with `Tab` to switch panels.
 - **Search & Replace** — Supports both hex (`x:AABB`) and ASCII patterns, with global or single replacement.
 - **Multi-step Undo / Redo** — Grouped actions with automatic merge of adjacent edits.
@@ -20,6 +20,7 @@
 - **Search Progress Bar** — Async search with real-time progress display (percentage + match count), cancelable with `Esc`.
 - **Count Prefix** — Type a number before commands to repeat them (e.g., `3l`, `5h`, `2dd`, `3x`), just like Vim.
 - **Visual Mode** — Press `v` to enter Visual mode for byte selection. Use movement keys to extend selection, `y` to yank (copy), `d` to cut, and `p` to paste.
+- **Built-in Help System** — Press `?` or `F1` for full-screen help with all keybindings and commands. Use `:help [topic]` to jump to specific topics. Status bar displays the current mode with color-coded indicators.
 
 ## Screenshot
 
@@ -91,6 +92,7 @@ hrush --import hex.txt
 | `n` | Jump to next search match |
 | `N` | Jump to previous search match |
 | `v` | Enter Visual mode (select bytes) |
+| `?` / `F1` | Open help page |
 | `p` | Paste yanked bytes after cursor |
 | `1-9` | Count prefix for repeating commands |
 | `:` | Enter Command mode |
@@ -126,6 +128,18 @@ hrush --import hex.txt
 | `d`, `x` | Delete (cut) selection |
 | `Esc` | Cancel selection, return to Normal mode |
 
+### Help Mode
+
+| Key | Action |
+|-----|--------|
+| `j`, `↓` | Scroll down |
+| `k`, `↑` | Scroll up |
+| `Ctrl+F`, `PageDown` | Page down |
+| `Ctrl+B`, `PageUp` | Page up |
+| `gg` | Jump to top |
+| `G` | Jump to bottom |
+| `q`, `Esc` | Close help |
+
 ### Command Mode
 
 Type a command after `:` and press `Enter`.
@@ -145,6 +159,7 @@ Type a command after `:` and press `Enter`.
 | `:export <path>` | Export current buffer as hex text |
 | `:s/old/new` | Replace current match |
 | `:%s/old/new/g` | Replace all matches globally |
+| `:help [topic]` | Open help (topics: overview, navigation, editing, visual, search, commands, frame) |
 
 > In `:s` and `:%s` commands, both `old` and `new` support hex patterns with the `x:` prefix (e.g., `:%s/x:DEAD/x:BEEF/g`). Without the prefix, the pattern is treated as ASCII text.
 

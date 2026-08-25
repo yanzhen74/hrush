@@ -5,13 +5,14 @@ mod app;
 mod buffer;
 mod command;
 mod editor;
+mod frame;
+mod help;
 mod import;
 mod input;
 mod large_file;
 mod ui;
 mod search;
 mod undo;
-mod frame;
 
 #[derive(Parser, Debug)]
 #[command(name = "hrush")]

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 
-use crate::app::App;
+use crate::app::{App, Mode};
 use crate::buffer::FileSource;
 use crate::frame::{ViewMode, FrameConfig, build_frame_index};
 use crate::import;
@@ -94,6 +94,11 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
                 let offset = parse_offset(parts[1])?;
                 app.cursor_offset = offset.min(app.buffer.len().saturating_sub(1));
             }
+        }
+        "help" | "h" => {
+            app.help_topic = parts.get(1).map(|s| s.to_string());
+            app.help_scroll = 0;
+            app.mode = Mode::Help;
         }
         "frame" => {
             if parts.len() >= 2 {

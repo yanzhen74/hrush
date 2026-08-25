@@ -15,6 +15,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Command => (" COMMAND ", Color::Yellow),
         Mode::Search => (" SEARCH ", Color::Magenta),
         Mode::Visual => (" VISUAL ", Color::Magenta),
+        Mode::Help => (" HELP ", Color::Cyan),
     };
 
     let file_name = app

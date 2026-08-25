@@ -1,10 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::app::App;
+use crate::app::{App, Mode};
 
 mod command_line;
 mod hex_view;
+mod help_view;
 mod status_bar;
 pub mod frame_view;
 
@@ -26,7 +27,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    if app.is_frame_mode() {
+    if app.mode == Mode::Help {
+        help_view::draw(frame, layout[0], app);
+    } else if app.is_frame_mode() {
         frame_view::render_frame_view(frame, layout[0], app);
     } else {
         let buffer = &app.buffer;

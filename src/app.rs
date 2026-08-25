@@ -23,6 +23,7 @@ pub enum Mode {
     Command,
     Search,
     Visual,
+    Help,
 }
 
 pub struct App {
@@ -49,6 +50,8 @@ pub struct App {
     pub count_prefix: Option<usize>,
     pub visual_anchor: Option<usize>,
     pub yank_buffer: Vec<u8>,
+    pub help_scroll: usize,
+    pub help_topic: Option<String>,
 }
 
 impl App {
@@ -77,6 +80,8 @@ impl App {
             count_prefix: None,
             visual_anchor: None,
             yank_buffer: Vec::new(),
+            help_scroll: 0,
+            help_topic: None,
         }
     }
 

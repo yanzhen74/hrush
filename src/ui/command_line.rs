@@ -39,19 +39,84 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                 frame.render_widget(paragraph, area);
             } else {
                 let help = Line::from(vec![
+                    Span::styled("?", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Help  "),
                     Span::styled("h/j/k/l", Style::default().fg(Color::Yellow)),
-                    Span::raw(" move | "),
+                    Span::raw(":Move  "),
+                    Span::styled("i", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Insert  "),
+                    Span::styled("/", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Search  "),
                     Span::styled(":", Style::default().fg(Color::Yellow)),
-                    Span::raw(" command | "),
-                    Span::styled("Tab", Style::default().fg(Color::Yellow)),
-                    Span::raw(" switch panel"),
+                    Span::raw(":Command  "),
+                    Span::styled("v", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Visual"),
                 ]);
                 let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
                 frame.render_widget(paragraph, area);
             }
         }
-        _ => {
-            frame.render_widget(Paragraph::new(""), area);
+        Mode::Insert => {
+            if let Some((msg, _)) = &app.message {
+                let line = Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)));
+                let paragraph = Paragraph::new(line);
+                frame.render_widget(paragraph, area);
+            } else {
+                let help = Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Exit  Type hex bytes or ascii chars"),
+                ]);
+                let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(paragraph, area);
+            }
+        }
+        Mode::Replace => {
+            if let Some((msg, _)) = &app.message {
+                let line = Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)));
+                let paragraph = Paragraph::new(line);
+                frame.render_widget(paragraph, area);
+            } else {
+                let help = Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Exit  Overwrite bytes"),
+                ]);
+                let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(paragraph, area);
+            }
+        }
+        Mode::Visual => {
+            if let Some((msg, _)) = &app.message {
+                let line = Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)));
+                let paragraph = Paragraph::new(line);
+                frame.render_widget(paragraph, area);
+            } else {
+                let help = Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Cancel  "),
+                    Span::styled("y", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Yank  "),
+                    Span::styled("d", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Delete  "),
+                    Span::styled("p", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Paste"),
+                ]);
+                let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(paragraph, area);
+            }
+        }
+        Mode::Help => {
+            let help = Line::from(vec![
+                Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
+                Span::raw(":Close  "),
+                Span::styled("j/k", Style::default().fg(Color::Yellow)),
+                Span::raw(":Scroll  "),
+                Span::styled("Ctrl+F/B", Style::default().fg(Color::Yellow)),
+                Span::raw(":Page  "),
+                Span::styled("G", Style::default().fg(Color::Yellow)),
+                Span::raw(":Bottom"),
+            ]);
+            let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(paragraph, area);
         }
     }
 }
