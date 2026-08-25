@@ -122,6 +122,50 @@ impl Buffer {
         Some(value)
     }
 
+    pub fn insert_bytes(&mut self, offset: usize, bytes: &[u8]) {
+        let offset = offset.min(self.data.len());
+        let len = bytes.len();
+
+        // 使用 splice 一次性插入
+        self.data.splice(offset..offset, bytes.iter().copied());
+
+        // 批量更新 modified 索引：offset 以上的全部 +len
+        let mut new_modified = HashSet::new();
+        for &idx in &self.modified {
+            if idx >= offset {
+                new_modified.insert(idx + len);
+            } else {
+                new_modified.insert(idx);
+            }
+        }
+        // 标记新插入的字节为 modified
+        for i in 0..len {
+            new_modified.insert(offset + i);
+        }
+        self.modified = new_modified;
+        self.dirty = true;
+    }
+
+    pub fn remove_range(&mut self, offset: usize, len: usize) -> Vec<u8> {
+        let end = (offset + len).min(self.data.len());
+        let actual_len = end - offset;
+        let removed: Vec<u8> = self.data.drain(offset..end).collect();
+
+        // 批量更新 modified 索引
+        let mut new_modified = HashSet::new();
+        for &idx in &self.modified {
+            if idx >= end {
+                new_modified.insert(idx - actual_len);
+            } else if idx < offset {
+                new_modified.insert(idx);
+            }
+            // idx in [offset, end) 的被删除，不保留
+        }
+        self.modified = new_modified;
+        self.dirty = true;
+        removed
+    }
+
     pub fn is_modified(&self, offset: usize) -> bool {
         self.modified.contains(&offset)
     }

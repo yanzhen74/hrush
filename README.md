@@ -9,7 +9,7 @@
 
 - **High Performance** — Written in Rust with memory-mapped file support (`mmap`) for large files.
 - **Vi-style Key Bindings** — Familiar `hjkl` navigation and modal editing for power users.
-- **Five Modes** — Normal / Insert / Replace / Command / Search.
+- **Six Modes** — Normal / Insert / Replace / Visual / Command / Search.
 - **Dual-panel Editing** — Hex and ASCII views side-by-side with `Tab` to switch panels.
 - **Search & Replace** — Supports both hex (`x:AABB`) and ASCII patterns, with global or single replacement.
 - **Multi-step Undo / Redo** — Grouped actions with automatic merge of adjacent edits.
@@ -18,6 +18,8 @@
 - **Modified Byte Highlighting** — Changed bytes are highlighted in yellow for easy tracking.
 - **Append Insert (`a`)** — Press `a` to insert after cursor, just like Vim's append mode.
 - **Search Progress Bar** — Async search with real-time progress display (percentage + match count), cancelable with `Esc`.
+- **Count Prefix** — Type a number before commands to repeat them (e.g., `3l`, `5h`, `2dd`, `3x`), just like Vim.
+- **Visual Mode** — Press `v` to enter Visual mode for byte selection. Use movement keys to extend selection, `y` to yank (copy), `d` to cut, and `p` to paste.
 
 ## Screenshot
 
@@ -88,6 +90,9 @@ hrush --import hex.txt
 | `/` | Enter Search mode |
 | `n` | Jump to next search match |
 | `N` | Jump to previous search match |
+| `v` | Enter Visual mode (select bytes) |
+| `p` | Paste yanked bytes after cursor |
+| `1-9` | Count prefix for repeating commands |
 | `:` | Enter Command mode |
 
 ### Insert Mode
@@ -105,6 +110,21 @@ hrush --import hex.txt
 | `0-9`, `a-f` | Overwrite hex digits in Hex panel |
 | Any printable ASCII | Overwrite ASCII character in ASCII panel |
 | `Esc` | Return to Normal mode |
+
+### Visual Mode
+
+| Key | Action |
+|-----|--------|
+| `h`, `←` | Extend selection left |
+| `l`, `→` | Extend selection right |
+| `k`, `↑` | Extend selection up |
+| `j`, `↓` | Extend selection down |
+| `0` | Extend selection to start of line |
+| `$` | Extend selection to end of line |
+| `G` | Extend selection to end of file |
+| `y` | Yank (copy) selection |
+| `d`, `x` | Delete (cut) selection |
+| `Esc` | Cancel selection, return to Normal mode |
 
 ### Command Mode
 

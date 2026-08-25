@@ -38,6 +38,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             app.active_panel,
             app.scroll_offset,
             &app.search_state,
+            app.selection_range(),
         );
     }
 

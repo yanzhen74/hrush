@@ -22,6 +22,7 @@ pub enum Mode {
     Replace,
     Command,
     Search,
+    Visual,
 }
 
 pub struct App {
@@ -45,6 +46,9 @@ pub struct App {
     pub frame_original_len: Option<usize>,
     pub visible_bytes: usize,
     pub insert_after: bool,
+    pub count_prefix: Option<usize>,
+    pub visual_anchor: Option<usize>,
+    pub yank_buffer: Vec<u8>,
 }
 
 impl App {
@@ -70,7 +74,14 @@ impl App {
             frame_original_len: None,
             visible_bytes: 0,
             insert_after: false,
+            count_prefix: None,
+            visual_anchor: None,
+            yank_buffer: Vec::new(),
         }
+    }
+
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        self.visual_anchor.map(|anchor| (anchor.min(self.cursor_offset), anchor.max(self.cursor_offset)))
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {

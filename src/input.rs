@@ -30,6 +30,7 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
         Mode::Replace => handle_replace_mode(app, key),
         Mode::Command => handle_command_mode(app, key),
         Mode::Search => handle_search_mode(app, key),
+        Mode::Visual => handle_visual_mode(app, key),
     }
 
     Ok(())
@@ -63,7 +64,10 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
         }
         'd' => {
             if key.code == KeyCode::Char('d') {
-                delete_line(app);
+                let count = app.count_prefix.take().unwrap_or(1);
+                for _ in 0..count {
+                    delete_line(app);
+                }
             } else {
                 handle_normal_mode(app, key);
             }
@@ -76,6 +80,19 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent) {
+    // 数字前缀累积（'0' 仅在已有前缀时累积，否则保留行首逻辑）
+    if let KeyCode::Char(c @ '1'..='9') = key.code {
+        let digit = (c as u8 - b'0') as usize;
+        app.count_prefix = Some(app.count_prefix.unwrap_or(0) * 10 + digit);
+        return;
+    }
+    if let KeyCode::Char('0') = key.code {
+        if app.count_prefix.is_some() {
+            app.count_prefix = Some(app.count_prefix.unwrap() * 10);
+            return;
+        }
+    }
+
     // 帧模式下优先使用帧导航逻辑
     if handle_frame_navigation(app, key) {
         return;
@@ -138,16 +155,20 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // 移动
         KeyCode::Char('h') | KeyCode::Left => {
-            move_cursor_left(app);
+            let count = app.count_prefix.take().unwrap_or(1);
+            move_cursor_left(app, count);
         }
         KeyCode::Char('l') | KeyCode::Right => {
-            move_cursor_right(app);
+            let count = app.count_prefix.take().unwrap_or(1);
+            move_cursor_right(app, count);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            move_cursor_up(app);
+            let count = app.count_prefix.take().unwrap_or(1);
+            move_cursor_up(app, count);
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            move_cursor_down(app);
+            let count = app.count_prefix.take().unwrap_or(1);
+            move_cursor_down(app, count);
         }
 
         // 快速移动
@@ -177,8 +198,36 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // 编辑
         KeyCode::Char('x') => {
             if !app.buffer.is_empty() {
-                editor::remove_byte(app, app.cursor_offset);
+                let count = app.count_prefix.take().unwrap_or(1);
+                app.undo_manager.begin_group("delete bytes");
+                for _ in 0..count {
+                    if !app.buffer.is_empty() {
+                        editor::remove_byte(app, app.cursor_offset);
+                    }
+                }
+                app.undo_manager.end_group();
                 clamp_cursor(app);
+            }
+        }
+
+        // Visual 模式
+        KeyCode::Char('v') => {
+            app.mode = Mode::Visual;
+            app.visual_anchor = Some(app.cursor_offset);
+        }
+
+        // 粘贴
+        KeyCode::Char('p') => {
+            if !app.yank_buffer.is_empty() {
+                let insert_pos = if app.buffer.is_empty() {
+                    0
+                } else {
+                    app.cursor_offset + 1
+                };
+                let yank_data = app.yank_buffer.clone();
+                let len = yank_data.len();
+                editor::insert_bytes(app, insert_pos, &yank_data);
+                app.cursor_offset = (insert_pos + len - 1).min(app.buffer.len().saturating_sub(1));
             }
         }
 
@@ -213,6 +262,71 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             }
         }
 
+        _ => {}
+    }
+
+    // 未提前 return 的动作执行完后清除 count 前缀
+    app.count_prefix = None;
+}
+
+fn handle_visual_mode(app: &mut App, key: KeyEvent) {
+    // 数字键累积（与 Normal 相同逻辑）
+    if let KeyCode::Char(c @ '1'..='9') = key.code {
+        let digit = (c as u8 - b'0') as usize;
+        app.count_prefix = Some(app.count_prefix.unwrap_or(0) * 10 + digit);
+        return;
+    }
+    if let KeyCode::Char('0') = key.code {
+        if app.count_prefix.is_some() {
+            app.count_prefix = Some(app.count_prefix.unwrap() * 10);
+            return;
+        }
+    }
+
+    let count = app.count_prefix.take().unwrap_or(1);
+
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            app.visual_anchor = None;
+        }
+        KeyCode::Char('h') | KeyCode::Left => move_cursor_left(app, count),
+        KeyCode::Char('l') | KeyCode::Right => move_cursor_right(app, count),
+        KeyCode::Char('k') | KeyCode::Up => move_cursor_up(app, count),
+        KeyCode::Char('j') | KeyCode::Down => move_cursor_down(app, count),
+        KeyCode::Char('0') => {
+            app.cursor_offset = app.cursor_offset / 16 * 16;
+        }
+        KeyCode::Char('$') => {
+            if !app.buffer.is_empty() {
+                app.cursor_offset = ((app.cursor_offset / 16 + 1) * 16 - 1).min(app.buffer.len().saturating_sub(1));
+            }
+        }
+        KeyCode::Char('G') => {
+            if !app.buffer.is_empty() {
+                app.cursor_offset = app.buffer.len().saturating_sub(1);
+            }
+        }
+        KeyCode::Char('y') => {
+            if let Some((start, end)) = app.selection_range() {
+                let len = end - start + 1;
+                app.yank_buffer = app.buffer.get_range(start, len).to_vec();
+                app.mode = Mode::Normal;
+                app.visual_anchor = None;
+                app.cursor_offset = start;
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('x') => {
+            if let Some((start, end)) = app.selection_range() {
+                let len = end - start + 1;
+                app.yank_buffer = app.buffer.get_range(start, len).to_vec();
+                editor::remove_range(app, start, len);
+                app.mode = Mode::Normal;
+                app.visual_anchor = None;
+                app.cursor_offset = start;
+                clamp_cursor(app);
+            }
+        }
         _ => {}
     }
 }
@@ -428,28 +542,24 @@ fn char_to_nibble(key: KeyEvent) -> Option<u8> {
     }
 }
 
-fn move_cursor_left(app: &mut App) {
-    if app.cursor_offset > 0 {
-        app.cursor_offset -= 1;
-    }
+fn move_cursor_left(app: &mut App, count: usize) {
+    app.cursor_offset = app.cursor_offset.saturating_sub(count);
 }
 
-fn move_cursor_right(app: &mut App) {
-    if !app.buffer.is_empty() && app.cursor_offset < app.buffer.len().saturating_sub(1) {
-        app.cursor_offset += 1;
-    }
+fn move_cursor_right(app: &mut App, count: usize) {
+    if app.buffer.is_empty() { return; }
+    let max = app.buffer.len().saturating_sub(1);
+    app.cursor_offset = (app.cursor_offset + count).min(max);
 }
 
-fn move_cursor_up(app: &mut App) {
-    if app.cursor_offset >= 16 {
-        app.cursor_offset -= 16;
-    }
+fn move_cursor_up(app: &mut App, count: usize) {
+    app.cursor_offset = app.cursor_offset.saturating_sub(16 * count);
 }
 
-fn move_cursor_down(app: &mut App) {
-    if app.cursor_offset + 16 < app.buffer.len() {
-        app.cursor_offset += 16;
-    }
+fn move_cursor_down(app: &mut App, count: usize) {
+    if app.buffer.is_empty() { return; }
+    let max = app.buffer.len().saturating_sub(1);
+    app.cursor_offset = (app.cursor_offset + 16 * count).min(max);
 }
 
 fn page_down(app: &mut App) {
@@ -527,36 +637,43 @@ fn handle_frame_navigation(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Char('h') | KeyCode::Left => {
+            let count = app.count_prefix.take().unwrap_or(1);
             if app.cursor_offset > current_frame.offset {
-                app.cursor_offset -= 1;
+                let min_offset = current_frame.offset;
+                app.cursor_offset = app.cursor_offset.saturating_sub(count).max(min_offset);
                 sync_h_scroll(app);
             }
             true
         }
         KeyCode::Char('l') | KeyCode::Right => {
+            let count = app.count_prefix.take().unwrap_or(1);
             let frame_end = current_frame.offset + current_frame.length.saturating_sub(1);
             if app.cursor_offset < frame_end {
-                app.cursor_offset += 1;
+                app.cursor_offset = (app.cursor_offset + count).min(frame_end);
                 sync_h_scroll(app);
             }
             true
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if current_frame_num + 1 < frame_index.frames.len() {
+            let count = app.count_prefix.take().unwrap_or(1);
+            let target_frame_num = (current_frame_num + count).min(frame_index.frames.len() - 1);
+            if target_frame_num != current_frame_num {
                 let col = app.cursor_offset.saturating_sub(current_frame.offset);
-                let next_frame = &frame_index.frames[current_frame_num + 1];
-                let next_col = col.min(next_frame.length.saturating_sub(1));
-                app.cursor_offset = next_frame.offset + next_col;
+                let target_frame = &frame_index.frames[target_frame_num];
+                let target_col = col.min(target_frame.length.saturating_sub(1));
+                app.cursor_offset = target_frame.offset + target_col;
                 sync_v_scroll(app);
             }
             true
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if current_frame_num > 0 {
+            let count = app.count_prefix.take().unwrap_or(1);
+            let target_frame_num = current_frame_num.saturating_sub(count);
+            if target_frame_num != current_frame_num {
                 let col = app.cursor_offset.saturating_sub(current_frame.offset);
-                let prev_frame = &frame_index.frames[current_frame_num - 1];
-                let prev_col = col.min(prev_frame.length.saturating_sub(1));
-                app.cursor_offset = prev_frame.offset + prev_col;
+                let target_frame = &frame_index.frames[target_frame_num];
+                let target_col = col.min(target_frame.length.saturating_sub(1));
+                app.cursor_offset = target_frame.offset + target_col;
                 sync_v_scroll(app);
             }
             true
