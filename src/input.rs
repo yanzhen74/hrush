@@ -448,7 +448,11 @@ fn handle_command_mode(app: &mut App, key: KeyEvent) {
             if let Err(e) = command::execute_command(app, cmd.trim()) {
                 app.message = Some((format!("Error: {}", e), std::time::Instant::now()));
             }
-            app.mode = Mode::Normal;
+            // 仅当命令没有切换模式时回到 Normal；
+            // :help 等命令会将模式切走（如 Mode::Help），不能被覆盖回去
+            if app.mode == Mode::Command {
+                app.mode = Mode::Normal;
+            }
             app.command_input.clear();
         }
         KeyCode::Esc => {
@@ -803,6 +807,51 @@ fn frame_page_down(app: &mut App) {
         let target_col = col.min(target.length.saturating_sub(1));
         app.cursor_offset = target.offset + target_col;
         sync_v_scroll(app);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// 回归测试：`:help` 命令应进入 Help 模式而不是被强制回 Normal（修复 :help 无反应的 bug）
+    #[test]
+    fn help_command_enters_help_mode() {
+        let mut app = App::new();
+        app.mode = Mode::Command;
+        app.command_input = "help".to_string();
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Help, "`:help` 后应进入 Help 模式");
+        assert_eq!(app.help_topic, None);
+        assert!(app.command_input.is_empty(), "命令输入框应已清空");
+    }
+
+    #[test]
+    fn help_command_with_topic_enters_help_mode() {
+        let mut app = App::new();
+        app.mode = Mode::Command;
+        app.command_input = "help search".to_string();
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.help_topic.as_deref(), Some("search"));
+    }
+
+    /// 不切换模式的命令（如 :goto）仍应回到 Normal 模式，确保修复不影响原有行为
+    #[test]
+    fn normal_command_returns_to_normal_mode() {
+        let mut app = App::new();
+        app.mode = Mode::Command;
+        app.command_input = "g 0".to_string();
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.cursor_offset, 0);
     }
 }
 
