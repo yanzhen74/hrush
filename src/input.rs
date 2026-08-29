@@ -107,6 +107,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         }
     }
 
+    // 校验和浮层打开时：拦截 q/Esc 关闭，其余键穿透到原有导航逻辑
+    if app.sum_open {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.sum_open = false;
+            return;
+        }
+    }
+
     // 数字前缀累积（'0' 仅在已有前缀时累积，否则保留行首逻辑）
     if let KeyCode::Char(c @ '1'..='9') = key.code {
         let digit = (c as u8 - b'0') as usize;
@@ -417,6 +425,15 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
             if !app.buffer.is_empty() {
                 app.cursor_offset = app.buffer.len().saturating_sub(1);
             }
+        }
+        // 进入 Command 模式：选区范围暂存到 pending_range（校验和命令优先使用），
+        // 同时退出 Visual（visual_anchor 清空，选区高亮消失）
+        KeyCode::Char(':') => {
+            app.pending_range = app.selection_range();
+            app.visual_anchor = None;
+            app.mode = Mode::Command;
+            app.command_input.clear();
+            app.history_index = None;
         }
         KeyCode::Char('y') => {
             if let Some((start, end)) = app.selection_range() {
@@ -1289,6 +1306,74 @@ mod tests {
             app.type_panel_open = false;
         }
         assert!(!app.type_panel_open, "进入 Insert 后面板应被守卫关闭");
+    }
+
+    // -----------------------------------------------------------------------
+    // 校验和回归测试（Task #18）
+    // -----------------------------------------------------------------------
+
+    /// Visual 选区后按 `:` 进入 Command 模式：选区暂存到 pending_range，
+    /// visual_anchor 清空；空命令执行后 pending_range 也被清空；
+    /// 带选区执行 `:md5` 消息行只包含选区（"abc"）的 MD5
+    #[test]
+    fn visual_colon_stashes_selection_and_md5_uses_it() {
+        let mut app = app_with_data(b"0123456789");
+        app.cursor_offset = 2;
+        let _ = handle_input(&mut app, key('v'));
+        let _ = handle_input(&mut app, key('l'));
+        let _ = handle_input(&mut app, key('l')); // 选区 2..=4（3 字节）
+        let _ = handle_input(&mut app, key(':'));
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.pending_range, Some((2, 4)), "选区应暂存到 pending_range");
+        assert_eq!(app.visual_anchor, None, "进入 Command 后应退出 Visual");
+
+        // 空命令执行后暂存范围应清空，不污染后续命令
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.pending_range, None, "命令执行后应清空 pending_range");
+
+        // 再来一次：选区后执行 :md5，只算选区字节（3 字节 0x32 0x33 0x34）
+        let mut app = app_with_data(b"0123456789");
+        app.cursor_offset = 2;
+        let _ = handle_input(&mut app, key('v'));
+        let _ = handle_input(&mut app, key('l'));
+        let _ = handle_input(&mut app, key('l'));
+        let _ = handle_input(&mut app, key(':'));
+        app.command_input = "md5".to_string();
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let (msg, _) = app.message.as_ref().expect("应有消息行");
+        assert_eq!(
+            msg,
+            "MD5: 289dff07669d7a23de0ef88d2f7129e7",
+            ":md5 应只计算选区字节 0x32..0x34"
+        );
+    }
+
+    /// `:sum` 打开校验和浮层，q / Esc 关闭（其余键穿透不影响导航）
+    #[test]
+    fn sum_panel_opens_and_closes_with_q_or_esc() {
+        let mut app = app_with_data(b"abc");
+        app.mode = Mode::Command;
+        app.command_input = "sum".to_string();
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.sum_open, ":sum 应打开校验和浮层");
+        assert!(app.sum_info.is_some());
+
+        let _ = handle_input(&mut app, key('q'));
+        assert!(!app.sum_open, "q 应关闭校验和浮层");
+        // 光标未移动，确认 q 只用于关闭浮层（同 type panel 拦截语义）
+        assert_eq!(app.cursor_offset, 0);
+
+        // Esc 同样关闭；关闭后导航键恢复正常（l 移动光标）
+        app.mode = Mode::Command;
+        app.command_input = "sum".to_string();
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.sum_open);
+        let _ = handle_input(&mut app, esc());
+        assert!(!app.sum_open, "Esc 应关闭校验和浮层");
+        let _ = handle_input(&mut app, key('l'));
+        assert_eq!(app.cursor_offset, 1, "关闭后导航键应恢复正常");
     }
 
     // -----------------------------------------------------------------------

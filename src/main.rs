@@ -3,6 +3,7 @@ use anyhow::Result;
 
 mod app;
 mod buffer;
+mod checksum;
 mod command;
 mod editor;
 mod frame;

@@ -9,3 +9,5 @@ crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
 anyhow = "1"
+md-5 = "0.10"
+sha2 = "0.10"

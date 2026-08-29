@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::buffer::Buffer;
+use crate::checksum::ChecksumInfo;
 use crate::search::SearchState;
 use crate::ui::{self, Panel};
 use crate::undo::UndoManager;
@@ -71,6 +72,9 @@ pub struct App {
     pub history_index: Option<usize>,
     pub last_change: Option<LastChange>,
     pub change_start: Option<usize>,
+    pub pending_range: Option<(usize, usize)>,
+    pub sum_open: bool,
+    pub sum_info: Option<ChecksumInfo>,
 }
 
 impl App {
@@ -110,6 +114,9 @@ impl App {
             history_index: None,
             last_change: None,
             change_start: None,
+            pending_range: None,
+            sum_open: false,
+            sum_info: None,
         }
     }
 
@@ -175,9 +182,12 @@ impl App {
             terminal.draw(|frame| ui::draw(frame, self))?;
             self.handle_events()?;
 
-            // 切入 Insert/Command 等非 Normal 模式时自动关闭类型解读面板
+            // 切入 Insert/Command 等非 Normal 模式时自动关闭浮层面板（类型解读/校验和）
             if self.mode != Mode::Normal && self.type_panel_open {
                 self.type_panel_open = false;
+            }
+            if self.mode != Mode::Normal && self.sum_open {
+                self.sum_open = false;
             }
 
             // 事件处理后再更新 scroll_offset，确保 cursor_offset 变化后立即同步
