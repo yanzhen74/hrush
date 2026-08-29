@@ -321,10 +321,16 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             repeat_last_change(app, count);
         }
 
-        // Visual 模式
+        // Visual 模式（V 进入行选模式）
         KeyCode::Char('v') => {
             app.mode = Mode::Visual;
             app.visual_anchor = Some(app.cursor_offset);
+            app.visual_line = false;
+        }
+        KeyCode::Char('V') => {
+            app.mode = Mode::Visual;
+            app.visual_anchor = Some(app.cursor_offset);
+            app.visual_line = true;
         }
 
         // 粘贴
@@ -454,6 +460,11 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.mode = Mode::Normal;
             app.visual_anchor = None;
+            app.visual_line = false;
+        }
+        // v / V 在字符选区与行选区之间切换（锚点不变）
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            app.visual_line = !app.visual_line;
         }
         KeyCode::Char('h') | KeyCode::Left => move_cursor_left(app, count),
         KeyCode::Char('l') | KeyCode::Right => move_cursor_right(app, count),
@@ -477,6 +488,7 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char(':') => {
             app.pending_range = app.selection_range();
             app.visual_anchor = None;
+            app.visual_line = false;
             app.mode = Mode::Command;
             app.command_input.clear();
             app.history_index = None;
@@ -487,6 +499,7 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
                 app.yank_buffer = app.buffer.get_range(start, len).to_vec();
                 app.mode = Mode::Normal;
                 app.visual_anchor = None;
+                app.visual_line = false;
                 app.cursor_offset = start;
             }
         }
@@ -497,6 +510,7 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
                 editor::remove_range(app, start, len);
                 app.mode = Mode::Normal;
                 app.visual_anchor = None;
+                app.visual_line = false;
                 app.cursor_offset = start;
                 clamp_cursor(app);
                 app.last_change = Some(LastChange::Delete { len });
@@ -1860,6 +1874,107 @@ mod tests {
         let _ = handle_input(&mut app, key('0'));
         assert_eq!(app.cursor_offset, 32, "0 应定位到当前帧首字节");
         assert_eq!(app.selection_range(), Some((2, 32)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Visual Line 行选模式回归测试（Task #23）
+    // -----------------------------------------------------------------------
+
+    /// V 进入行选，j 扩展整行；selection_range 吸附 16 字节行边界
+    #[test]
+    fn visual_line_snaps_selection_to_16_byte_rows() {
+        let mut app = app_with_data(&[0u8; 48]);
+        app.cursor_offset = 5;
+
+        let _ = handle_input(&mut app, key('V'));
+        assert_eq!(app.mode, Mode::Visual);
+        assert!(app.visual_line, "V 应进入行选模式");
+        assert_eq!(app.selection_range(), Some((0, 15)), "单行选区应吸附整行");
+
+        let _ = handle_input(&mut app, key('j'));
+        assert_eq!(app.cursor_offset, 21);
+        assert_eq!(app.selection_range(), Some((0, 31)), "j 应扩展包含整个第二行");
+    }
+
+    /// 帧模式（定长 32）下行选吸附帧边界
+    #[test]
+    fn visual_line_snaps_to_frame_boundaries() {
+        let mut app = app_with_frames(&[0u8; 96], 32);
+        app.cursor_offset = 5;
+
+        let _ = handle_input(&mut app, key('V'));
+        assert_eq!(app.selection_range(), Some((0, 31)), "单帧应吸附到帧边界");
+
+        let _ = handle_input(&mut app, key('j'));
+        assert_eq!(app.cursor_offset, 37);
+        assert_eq!(app.selection_range(), Some((0, 63)), "j 应扩展包含整个第二帧");
+    }
+
+    /// Visual 内 v/V 互切，锚点不变；切换后选区吸附行为随之变化
+    #[test]
+    fn visual_v_v_toggle_switches_line_mode() {
+        let mut app = app_with_data(&[0u8; 48]);
+        app.cursor_offset = 5;
+
+        let _ = handle_input(&mut app, key('V'));
+        assert!(app.visual_line);
+        let _ = handle_input(&mut app, key('v'));
+        assert!(!app.visual_line, "v 应切换为字符选区");
+        assert_eq!(app.selection_range(), Some((5, 5)), "切换后选区不再吸附行边界");
+        let _ = handle_input(&mut app, key('l'));
+        let _ = handle_input(&mut app, key('V'));
+        assert!(app.visual_line, "V 应切换回行选");
+        assert_eq!(app.selection_range(), Some((0, 15)));
+        assert_eq!(app.visual_anchor, Some(5), "切换时锚点不变");
+    }
+
+    /// 行选 d 删除整行，光标移到删除位置起始处，并记录 last_change / yank
+    #[test]
+    fn visual_line_d_deletes_whole_rows() {
+        let mut app = app_with_data(&[1u8; 48]);
+        app.cursor_offset = 5;
+
+        let _ = handle_input(&mut app, key('V'));
+        let _ = handle_input(&mut app, key('j'));
+        let _ = handle_input(&mut app, key('d'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.visual_line, "退出 Visual 应清零 visual_line");
+        assert_eq!(app.buffer.len(), 16, "应删除前两行（32 字节）");
+        assert_eq!(app.cursor_offset, 0, "光标应移到删除位置起始处");
+        assert_eq!(app.last_change, Some(LastChange::Delete { len: 32 }));
+        assert_eq!(app.yank_buffer.len(), 32);
+    }
+
+    /// 行选 y 复制整行；Esc 退出后 visual_line 清零且锚点清空
+    #[test]
+    fn visual_line_y_and_esc_exit() {
+        let mut app = app_with_data(&[7u8; 32]);
+        app.cursor_offset = 20;
+
+        let _ = handle_input(&mut app, key('V'));
+        let _ = handle_input(&mut app, key('y'));
+        assert_eq!(app.yank_buffer, vec![7u8; 16], "y 应复制整个第二行");
+        assert_eq!(app.cursor_offset, 16, "复制后光标回到选区起始行首");
+        assert!(!app.visual_line);
+
+        let _ = handle_input(&mut app, key('V'));
+        assert!(app.visual_line);
+        let _ = handle_input(&mut app, esc());
+        assert!(!app.visual_line, "Esc 退出后 visual_line 应清零");
+        assert_eq!(app.visual_anchor, None);
+    }
+
+    /// 行选按 : 进入 Command：pending_range 为吸附后的整行范围，并退出 Visual
+    #[test]
+    fn visual_line_colon_stashes_snapped_range() {
+        let mut app = app_with_data(&[0u8; 48]);
+        app.cursor_offset = 20;
+
+        let _ = handle_input(&mut app, key('V'));
+        let _ = handle_input(&mut app, key(':'));
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(app.pending_range, Some((16, 31)), "pending_range 应为吸附后的整行范围");
+        assert!(!app.visual_line, "退出 Visual 应清零 visual_line");
     }
 }
 

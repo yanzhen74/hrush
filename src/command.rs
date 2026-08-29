@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 use crate::app::{App, Mode};
 use crate::buffer::FileSource;
 use crate::checksum::{self, ChecksumInfo};
+use crate::editor;
 use crate::frame::{ViewMode, FrameConfig, build_frame_index};
 use crate::import;
 use crate::search::{self, SearchPattern};
@@ -175,6 +176,45 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
                 Instant::now(),
             ));
         }
+        "fill" => {
+            if parts.len() < 2 {
+                bail!("Usage: :fill BYTE");
+            }
+            let value = parse_offset(parts[1])?;
+            if value > 0xFF {
+                bail!("Fill value exceeds 0xFF");
+            }
+            let (start, end) = selection_only_range(app, pending_range)
+                .ok_or_else(|| anyhow::anyhow!("No selection for :fill"))?;
+            let len = end - start + 1;
+            app.undo_manager.begin_group("fill selection");
+            for i in 0..len {
+                editor::set_byte(app, start + i, value as u8);
+            }
+            app.undo_manager.end_group();
+            app.message = Some((
+                format!("Filled {} byte(s) with {:02X}", len, value as u8),
+                Instant::now(),
+            ));
+        }
+        "set" => {
+            if parts.len() < 2 {
+                bail!("Usage: :set HEXBYTES");
+            }
+            let bytes = parse_hex_bytes(&parts[1..].join(" "))?;
+            let (start, end) = selection_only_range(app, pending_range)
+                .ok_or_else(|| anyhow::anyhow!("No selection for :set"))?;
+            let len = end - start + 1;
+            app.undo_manager.begin_group("set selection");
+            for i in 0..len {
+                editor::set_byte(app, start + i, bytes[i % bytes.len()]);
+            }
+            app.undo_manager.end_group();
+            app.message = Some((
+                format!("Set {} byte(s) with pattern", len),
+                Instant::now(),
+            ));
+        }
         "frame" => {
             if parts.len() >= 2 {
                 let arg = parts[1];
@@ -303,6 +343,15 @@ fn checksum_range(app: &App, pending_range: Option<(usize, usize)>) -> (usize, u
     pending_range
         .or_else(|| app.selection_range())
         .unwrap_or((0, app.buffer.len() - 1))
+}
+
+/// :fill / :set 操作范围：仅接受选区（不回退全文）；
+/// 优先级 pending_range > selection_range，无选区返回 None。
+fn selection_only_range(app: &App, pending_range: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    if app.buffer.is_empty() {
+        return None;
+    }
+    pending_range.or_else(|| app.selection_range())
 }
 
 /// 按范围取字节切片（含两端），越界由 get_range 钳制，空缓冲区返回空切片
@@ -964,5 +1013,96 @@ mod tests {
         app.cursor_offset = 3;
         execute_command(&mut app, "sum16").unwrap();
         assert_eq!(app.message.as_ref().unwrap().0, "SUM16 (LE): 0204");
+    }
+
+    // -----------------------------------------------------------------------
+    // :fill / :set 回归测试（Task #23）
+    // -----------------------------------------------------------------------
+
+    /// `:fill` 填充选区（十六进制/十进制等价），单个可撤销编辑（一次 u 完全恢复）；
+    /// pending_range 优先于当前选区（模拟 Visual → : 流程）
+    #[test]
+    fn fill_command_fills_selection_and_undoes_in_one_step() {
+        let mut app = app_with_data(&[0u8; 8]);
+        app.visual_anchor = Some(2);
+        app.cursor_offset = 5;
+        execute_command(&mut app, "fill 0xFF").unwrap();
+        assert_eq!(app.buffer.data(), &[0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0]);
+        assert_eq!(app.message.as_ref().unwrap().0, "Filled 4 byte(s) with FF");
+
+        crate::editor::undo(&mut app);
+        assert_eq!(app.buffer.data(), &[0u8; 8], "一次 u 应完全撤销 :fill");
+
+        // 十进制 255 等价于 0xFF（与 :goto 数值解析风格一致）；
+        // undo 会把光标移回编辑起点，需恢复光标以保持原选区宽度
+        app.cursor_offset = 5;
+        execute_command(&mut app, "fill 255").unwrap();
+        assert_eq!(app.buffer.get_range(2, 4), &[0xFF; 4]);
+
+        // pending_range 优先：无活动选区时按暂存范围填充
+        let mut app = app_with_data(&[0u8; 8]);
+        app.pending_range = Some((6, 7));
+        execute_command(&mut app, "fill 0x11").unwrap();
+        assert_eq!(app.buffer.get_range(6, 2), &[0x11, 0x11]);
+    }
+
+    /// `:set` 循环覆盖选区（选区长 5 → AA BB AA BB AA）；支持空格分隔；单个可撤销编辑；
+    /// 序列长于选区时截断只覆盖选区
+    #[test]
+    fn set_command_cycles_pattern_over_selection() {
+        let mut app = app_with_data(&[0u8; 8]);
+        app.visual_anchor = Some(1);
+        app.cursor_offset = 5; // 选区 1..=5（5 字节）
+        execute_command(&mut app, "set AABB").unwrap();
+        assert_eq!(
+            app.buffer.data(),
+            &[0, 0xAA, 0xBB, 0xAA, 0xBB, 0xAA, 0, 0],
+            "序列短于选区应循环重复"
+        );
+
+        crate::editor::undo(&mut app);
+        assert_eq!(app.buffer.data(), &[0u8; 8], ":set 应为单个可撤销编辑");
+
+        // 空格分隔等价；序列长于选区时截断（只覆盖选区 5 字节）；
+        // undo 会把光标移回编辑起点，需恢复光标以保持原选区宽度
+        app.cursor_offset = 5;
+        execute_command(&mut app, "set AA BB").unwrap();
+        assert_eq!(app.buffer.get_range(1, 5), &[0xAA, 0xBB, 0xAA, 0xBB, 0xAA]);
+        execute_command(&mut app, "set AABBCCDDEE11").unwrap();
+        assert_eq!(app.buffer.get_range(1, 5), &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        assert_eq!(app.buffer.get_range(6, 2), &[0, 0], "选区外字节不应被修改");
+    }
+
+    /// 无选区时 `:fill` / `:set` 报错；非法值（>0xFF / 非法字符 / 奇数位）报错不修改数据；
+    /// 缺参数提示用法；报错后可继续使用（无残留状态）
+    #[test]
+    fn fill_and_set_require_selection_and_validate_args() {
+        let mut app = app_with_data(&[0u8; 8]);
+        let err = execute_command(&mut app, "fill 0xFF").unwrap_err();
+        assert!(err.to_string().contains("No selection for :fill"), "实际: {}", err);
+        let err = execute_command(&mut app, "set AABB").unwrap_err();
+        assert!(err.to_string().contains("No selection for :set"), "实际: {}", err);
+        assert_eq!(app.buffer.data(), &[0u8; 8], "报错不应修改数据");
+        assert!(!app.buffer.is_dirty());
+
+        // 有选区（暂存范围）时的参数校验：超宽值 / 非法数字 / 奇数位 / 非法 hex 字节
+        app.pending_range = Some((0, 3));
+        let err = execute_command(&mut app, "fill 0x100").unwrap_err();
+        assert!(err.to_string().contains("exceeds 0xFF"), "实际: {}", err);
+        let err = execute_command(&mut app, "fill zz").unwrap_err();
+        assert!(err.to_string().contains("Invalid offset"), "实际: {}", err);
+        let err = execute_command(&mut app, "set Z").unwrap_err();
+        assert!(err.to_string().contains("even number"), "实际: {}", err);
+        let err = execute_command(&mut app, "set GG").unwrap_err();
+        assert!(err.to_string().contains("Invalid hex byte"), "实际: {}", err);
+        let err = execute_command(&mut app, "fill").unwrap_err();
+        assert!(err.to_string().contains("Usage"), "实际: {}", err);
+        let err = execute_command(&mut app, "set").unwrap_err();
+        assert!(err.to_string().contains("Usage"), "实际: {}", err);
+
+        // 报错后命令仍可正常使用（无残留状态）
+        app.pending_range = Some((0, 1));
+        execute_command(&mut app, "fill 0x5A").unwrap();
+        assert_eq!(app.buffer.get_range(0, 2), &[0x5A, 0x5A]);
     }
 }

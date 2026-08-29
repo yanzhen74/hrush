@@ -60,6 +60,7 @@ pub struct App {
     pub insert_after: bool,
     pub count_prefix: Option<usize>,
     pub visual_anchor: Option<usize>,
+    pub visual_line: bool,
     pub yank_buffer: Vec<u8>,
     pub help_scroll: usize,
     pub help_topic: Option<String>,
@@ -105,6 +106,7 @@ impl App {
             insert_after: false,
             count_prefix: None,
             visual_anchor: None,
+            visual_line: false,
             yank_buffer: Vec::new(),
             help_scroll: 0,
             help_topic: None,
@@ -139,7 +141,27 @@ impl App {
     }
 
     pub fn selection_range(&self) -> Option<(usize, usize)> {
-        self.visual_anchor.map(|anchor| (anchor.min(self.cursor_offset), anchor.max(self.cursor_offset)))
+        let (mut start, mut end) = self.visual_anchor.map(|anchor| {
+            (anchor.min(self.cursor_offset), anchor.max(self.cursor_offset))
+        })?;
+        if self.visual_line && !self.buffer.is_empty() {
+            // 行选模式：起止吸附到行边界（帧模式按帧边界，否则按 16 字节行）
+            if self.is_frame_mode() {
+                if let Some(fi) = &self.frame_index {
+                    if let (Some(a), Some(b)) =
+                        (frame_at_offset(fi, start), frame_at_offset(fi, end))
+                    {
+                        let (lo, hi) = (a.min(b), a.max(b));
+                        start = fi.frames[lo].offset;
+                        end = fi.frames[hi].offset + fi.frames[hi].length.saturating_sub(1);
+                        return Some((start, end));
+                    }
+                }
+            }
+            start = start / 16 * 16;
+            end = ((end / 16 + 1) * 16 - 1).min(self.buffer.len().saturating_sub(1));
+        }
+        Some((start, end))
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {

@@ -63,6 +63,9 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
         title: "Visual Mode",
         entries: &[
             HelpEntry { key: "v", description: "Enter Visual mode (start selection at cursor)" },
+            HelpEntry { key: "V", description: "Enter Visual Line mode (select whole rows/frames)" },
+            HelpEntry { key: "v / V (in Visual)", description: "Toggle between character and line selection (anchor unchanged)" },
+            HelpEntry { key: "", description: "Visual Line mode snaps selection to 16-byte rows (or frame boundaries in frame mode)" },
             HelpEntry { key: "h/j/k/l", description: "Extend selection by moving cursor" },
             HelpEntry { key: "0 / $", description: "Extend selection to row start/end" },
             HelpEntry { key: "G", description: "Extend selection to end of file" },
@@ -119,6 +122,8 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: ":sum8", description: "8-bit additive checksum of selection (or whole file)" },
             HelpEntry { key: ":sum16", description: "16-bit additive checksum; word order follows global endianness (tail zero-padded)" },
             HelpEntry { key: ":sum32", description: "32-bit additive checksum; word order follows global endianness (tail zero-padded)" },
+            HelpEntry { key: ":fill BYTE", description: "Fill selection with a byte value (hex 0xAA or decimal 255); requires selection" },
+            HelpEntry { key: ":set HEXBYTES", description: "Overwrite selection with repeating hex bytes, e.g. :set AABB (spaces allowed); requires selection" },
             HelpEntry { key: ":import FILE", description: "Import hex text file" },
             HelpEntry { key: ":export FILE", description: "Export current buffer as hex text file" },
             HelpEntry { key: ":checksum", description: "Alias of :sum (Visual selection takes priority, otherwise whole file)" },
