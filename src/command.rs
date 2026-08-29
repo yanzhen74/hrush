@@ -114,6 +114,9 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
             app.sum_info = Some(make_checksum_info(app, range));
             app.sum_open = true;
         }
+        "list" | "matches" => {
+            open_match_list(app);
+        }
         "crc16" => {
             match parse_crc_args(16, &parts[1..]) {
                 Ok((params, label)) => {
@@ -240,6 +243,55 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 打开搜索匹配列表浮层：无结果时消息提示；有结果时选中初始化为最接近当前光标的匹配。
+/// 不检查模式（主循环守卫会在离开 Normal 时自动关闭）。
+pub(crate) fn open_match_list(app: &mut App) {
+    if app.search_state.matches.is_empty() {
+        app.message = Some(("No search results".to_string(), Instant::now()));
+        return;
+    }
+    let cursor = app.cursor_offset;
+    let sel = match app.search_state.matches.partition_point(|&off| off < cursor) {
+        0 => 0,
+        i if i >= app.search_state.matches.len() => app.search_state.matches.len() - 1,
+        i => {
+            // 前后两个候选中取离光标更近者（相等时取靠前者）
+            if cursor - app.search_state.matches[i - 1]
+                <= app.search_state.matches[i] - cursor
+            {
+                i - 1
+            } else {
+                i
+            }
+        }
+    };
+    app.match_list_sel = sel;
+    app.match_list_scroll = 0;
+    app.match_list_open = true;
+}
+
+/// 搜索模式摘要（用于匹配列表首行）：hex 模式按大写 hex 展示（通配 ??），
+/// ASCII 模式按原文展示；超长时截断加省略号。
+pub(crate) fn pattern_summary(p: &SearchPattern) -> String {
+    let raw = match p {
+        SearchPattern::Hex(b) => b
+            .iter()
+            .map(|b| match b {
+                Some(x) => format!("{:02X}", x),
+                None => "??".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        SearchPattern::Ascii(b) => String::from_utf8_lossy(b).into_owned(),
+    };
+    if raw.chars().count() > 40 {
+        let truncated: String = raw.chars().take(37).collect();
+        format!("{}...", truncated)
+    } else {
+        raw
+    }
 }
 
 /// 校验和计算范围：Visual 选区（含从 Visual 进入 Command 时暂存的 pending_range）优先，

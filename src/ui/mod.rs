@@ -6,6 +6,7 @@ use crate::app::{App, Mode};
 mod command_line;
 mod hex_view;
 mod help_view;
+mod match_list;
 mod status_bar;
 mod sum_view;
 mod type_view;
@@ -55,6 +56,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // 校验和浮层（仅 Normal 相关视图下显示）
     if app.mode != Mode::Help && app.sum_open {
         sum_view::draw(frame, layout[0], app);
+    }
+
+    // 搜索匹配列表浮层（仅 Normal 相关视图下显示）
+    if app.mode != Mode::Help && app.match_list_open {
+        match_list::draw(frame, layout[0], app);
     }
 
     status_bar::draw(frame, layout[1], app);

@@ -92,6 +92,41 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent) {
+    // 匹配列表浮层打开时：拦截列表自身按键，其余键穿透到原有导航逻辑（仿 type panel 范式）
+    if app.match_list_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.match_list_open = false;
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let count = app.count_prefix.take().unwrap_or(1);
+                app.match_list_sel = app.match_list_sel.saturating_sub(count);
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = app.count_prefix.take().unwrap_or(1);
+                let last = app.search_state.matches.len().saturating_sub(1);
+                app.match_list_sel = app.match_list_sel.saturating_add(count).min(last);
+                return;
+            }
+            KeyCode::Enter => {
+                if let Some(&offset) = app.search_state.matches.get(app.match_list_sel) {
+                    if offset != app.cursor_offset {
+                        app.push_jump();
+                    }
+                    app.cursor_offset = offset;
+                    // 同步 search_state 当前匹配，使 n/N 与高亮语义一致（无副作用则跳过）
+                    app.search_state.current_match = Some(app.match_list_sel);
+                }
+                app.match_list_open = false;
+                // 视图滚动由主循环的 scroll 同步逻辑自动跟随光标
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // 类型解读面板打开时：仅拦截面板自身按键，其余键穿透到原有导航逻辑
     if app.type_panel_open {
         match key.code {
@@ -161,6 +196,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // 类型解读面板入口
         KeyCode::Char('t') => {
             app.type_panel_open = true;
+        }
+
+        // 搜索匹配列表入口（与 :list 等价）
+        KeyCode::Char('L') => {
+            command::open_match_list(app);
         }
 
         // 模式切换
@@ -1647,6 +1687,120 @@ mod tests {
 
         editor::undo(&mut app);
         assert_eq!(app.buffer.data(), &after_session[..], "一次 undo 应完整撤销重放");
+    }
+
+    // -----------------------------------------------------------------------
+    // 搜索匹配列表回归测试（Task #20）
+    // -----------------------------------------------------------------------
+
+    /// 执行一次搜索并等待异步完成（收集 matches）
+    fn search_sync(app: &mut App, query: &str) {
+        app.mode = Mode::Search;
+        app.search_input = query.to_string();
+        let _ = handle_input(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        while !app.poll_search_result() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// 无搜索结果时 :list / L 只提示消息，不打开浮层
+    #[test]
+    fn list_without_results_shows_message() {
+        let mut app = app_with_data(b"hello world");
+        command::execute_command(&mut app, "list").unwrap();
+        assert!(!app.match_list_open);
+        assert_eq!(app.message.as_ref().unwrap().0, "No search results");
+
+        let _ = handle_input(&mut app, key('L'));
+        assert!(!app.match_list_open, "无结果时 L 不应打开浮层");
+        assert_eq!(app.message.as_ref().unwrap().0, "No search results");
+    }
+
+    /// 搜索后 :list / :matches 打开列表，选中初始化为最接近光标的匹配；L 等价
+    #[test]
+    fn list_opens_with_selection_near_cursor() {
+        let mut app = app_with_data(b"aaa aaa aaa"); // 匹配于 0, 4, 8
+        search_sync(&mut app, "aaa");
+        app.cursor_offset = 5;
+        command::execute_command(&mut app, "list").unwrap();
+        assert!(app.match_list_open, ":list 应打开匹配列表");
+        assert_eq!(app.match_list_sel, 1, "选中应为最接近光标的匹配（0x4）");
+
+        app.match_list_open = false;
+        command::execute_command(&mut app, "matches").unwrap();
+        assert!(app.match_list_open, ":matches 别名应同样打开");
+        app.match_list_open = false;
+        let _ = handle_input(&mut app, key('L'));
+        assert!(app.match_list_open, "L 快捷键应等价于 :list");
+    }
+
+    /// ↑↓ / jk 导航不越界；列表打开时导航键不移动光标
+    #[test]
+    fn list_navigation_clamps_at_bounds() {
+        let mut app = app_with_data(b"aaa aaa aaa");
+        search_sync(&mut app, "aaa");
+        app.cursor_offset = 0;
+        command::execute_command(&mut app, "list").unwrap();
+        assert_eq!(app.match_list_sel, 0);
+
+        for _ in 0..3 {
+            let _ = handle_input(&mut app, key('k'));
+        }
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.match_list_sel, 0, "顶部连续上移不越界");
+
+        for _ in 0..5 {
+            let _ = handle_input(&mut app, key('j'));
+        }
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.match_list_sel, 2, "底部连续下移不越界");
+        assert_eq!(app.cursor_offset, 0, "列表打开时导航键不移动光标");
+    }
+
+    /// Enter 跳转光标到选中匹配偏移并关闭，跳转点记入 jumplist；
+    /// q/Esc 只关闭不移动光标；关闭后 L 可再次打开
+    #[test]
+    fn list_enter_jumps_and_q_esc_close() {
+        let mut app = app_with_data(b"aaa aaa aaa");
+        search_sync(&mut app, "aaa");
+        app.cursor_offset = 2;
+        command::execute_command(&mut app, "list").unwrap();
+
+        let _ = handle_input(&mut app, key('j')); // 选中第二个匹配（0x4）
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.cursor_offset, 4, "Enter 应跳转到选中匹配偏移");
+        assert!(!app.match_list_open, "Enter 后应关闭列表");
+        assert_eq!(app.jump_back.last(), Some(&2), "跳转前位置应记入 jumplist");
+
+        // q 关闭：光标不动；L 再次打开后 Esc 同样关闭
+        command::execute_command(&mut app, "list").unwrap();
+        let _ = handle_input(&mut app, key('q'));
+        assert!(!app.match_list_open, "q 应关闭列表");
+        assert_eq!(app.cursor_offset, 4);
+
+        let _ = handle_input(&mut app, key('L'));
+        assert!(app.match_list_open);
+        let _ = handle_input(&mut app, esc());
+        assert!(!app.match_list_open, "Esc 应关闭列表");
+        assert_eq!(app.cursor_offset, 4);
+    }
+
+    /// 新搜索完成后列表刷新：保持打开，选中/滚动重置，显示新结果；
+    /// 替换清空结果后下次 :list 提示无结果（不做复杂失效追踪）
+    #[test]
+    fn list_refreshes_after_new_search() {
+        let mut app = app_with_data(b"aa aa aa");
+        search_sync(&mut app, "aa"); // 匹配于 0, 3, 6
+        command::execute_command(&mut app, "list").unwrap();
+        let _ = handle_input(&mut app, key('j'));
+        assert_eq!(app.match_list_sel, 1);
+
+        // 新搜索完成（模拟主循环 poll_result 收集），列表应刷新为新结果
+        search_sync(&mut app, "a"); // 匹配于 0, 1, 3, 4, 6, 7
+        assert!(app.match_list_open, "新搜索后列表应保持打开");
+        assert_eq!(app.match_list_sel, 0, "新搜索后选中应重置");
+        assert_eq!(app.match_list_scroll, 0);
+        assert_eq!(app.search_state.matches.len(), 6);
     }
 }
 

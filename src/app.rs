@@ -75,6 +75,9 @@ pub struct App {
     pub pending_range: Option<(usize, usize)>,
     pub sum_open: bool,
     pub sum_info: Option<ChecksumInfo>,
+    pub match_list_open: bool,
+    pub match_list_sel: usize,    // 匹配列表当前选中行
+    pub match_list_scroll: usize, // 匹配列表滚动偏移
 }
 
 impl App {
@@ -117,6 +120,9 @@ impl App {
             pending_range: None,
             sum_open: false,
             sum_info: None,
+            match_list_open: false,
+            match_list_sel: 0,
+            match_list_scroll: 0,
         }
     }
 
@@ -163,8 +169,8 @@ impl App {
                 self.cursor_offset = self.buffer.len().saturating_sub(1);
             }
 
-            // 检查异步搜索是否完成
-            if self.search_state.poll_result() {
+            // 检查异步搜索是否完成（收集结果后刷新打开中的匹配列表）
+            if self.poll_search_result() {
                 // 搜索完成，自动跳转到第一个匹配（跳转前记录原位置到 jumplist）
                 if let Some(offset) = self.search_state.first_match() {
                     if offset != self.cursor_offset {
@@ -188,6 +194,9 @@ impl App {
             }
             if self.mode != Mode::Normal && self.sum_open {
                 self.sum_open = false;
+            }
+            if self.mode != Mode::Normal && self.match_list_open {
+                self.match_list_open = false;
             }
 
             // 事件处理后再更新 scroll_offset，确保 cursor_offset 变化后立即同步
@@ -225,6 +234,20 @@ impl App {
     /// 是否有异步搜索正在执行
     pub fn is_searching(&self) -> bool {
         self.search_state.is_searching()
+    }
+
+    /// 检查异步搜索是否完成并收集结果；
+    /// 新搜索完成时重置匹配列表选中/滚动（列表打开时刷新显示新结果）
+    pub fn poll_search_result(&mut self) -> bool {
+        if self.search_state.poll_result() {
+            if self.match_list_open {
+                self.match_list_sel = 0;
+                self.match_list_scroll = 0;
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// 是否处于帧模式

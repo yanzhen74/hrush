@@ -81,16 +81,21 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    // 帧模式下添加帧信息
+    // 帧模式下添加帧信息（含当前帧实际帧长）
     if app.is_frame_mode() {
         if let Some(frame_idx) = app.current_frame_number() {
             let total = app.frame_index.as_ref().map(|fi| fi.frames.len()).unwrap_or(0);
             let frame_info = if let Some(fi) = &app.frame_index {
+                let len_str = fi
+                    .frames
+                    .get(frame_idx)
+                    .map(|fr| format!("len=0x{:X}", fr.length))
+                    .unwrap_or_default();
                 match &fi.config {
-                    FrameConfig::FixedLength { length } => format!("len={}", length),
+                    FrameConfig::FixedLength { .. } => len_str,
                     FrameConfig::SyncWord { pattern } => {
                         let pat_hex: String = pattern.iter().map(|b| format!("{:02X}", b)).collect();
-                        format!("sync={}", pat_hex)
+                        format!("sync={} {}", pat_hex, len_str)
                     }
                 }
             } else {
