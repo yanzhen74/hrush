@@ -52,6 +52,7 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: "x", description: "Delete byte at cursor" },
             HelpEntry { key: "dd", description: "Delete entire row (16 bytes width)" },
             HelpEntry { key: "p", description: "Paste yanked/deleted bytes after cursor" },
+            HelpEntry { key: ".", description: "Repeat last change (with count)" },
             HelpEntry { key: "u", description: "Undo last change" },
             HelpEntry { key: "Ctrl+R", description: "Redo last undone change" },
             HelpEntry { key: "Ctrl+W", description: "Toggle between Hex and ASCII panel" },

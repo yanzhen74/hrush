@@ -26,6 +26,16 @@ pub enum Mode {
     Help,
 }
 
+/// 上一次修改的类型与内容（用于 `.` 命令重放）
+#[derive(Clone, Debug, PartialEq)]
+pub enum LastChange {
+    Insert { bytes: Vec<u8> },      // i/a 会话插入的字节序列
+    Overwrite { bytes: Vec<u8> },   // R 会话覆盖写入的字节序列
+    ReplaceByte { value: u8 },      // r 单字节替换
+    Delete { len: usize },          // x / dd / Visual d,x 删除的长度
+    Paste,                          // p 粘贴（重放时用当前 yank_buffer）
+}
+
 pub struct App {
     pub running: bool,
     pub mode: Mode,
@@ -59,6 +69,8 @@ pub struct App {
     pub command_history: Vec<String>,
     pub search_history: Vec<String>,
     pub history_index: Option<usize>,
+    pub last_change: Option<LastChange>,
+    pub change_start: Option<usize>,
 }
 
 impl App {
@@ -96,6 +108,8 @@ impl App {
             command_history: Vec::new(),
             search_history: Vec::new(),
             history_index: None,
+            last_change: None,
+            change_start: None,
         }
     }
 

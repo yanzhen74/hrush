@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::app::{App, Mode};
+use crate::app::{App, LastChange, Mode};
 use crate::command;
 use crate::editor;
 use crate::frame::ViewMode;
@@ -73,8 +73,12 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
         'd' => {
             if key.code == KeyCode::Char('d') {
                 let count = app.count_prefix.take().unwrap_or(1);
+                let mut deleted = 0usize;
                 for _ in 0..count {
-                    delete_line(app);
+                    deleted += delete_line(app);
+                }
+                if deleted > 0 {
+                    app.last_change = Some(LastChange::Delete { len: deleted });
                 }
             } else {
                 handle_normal_mode(app, key);
@@ -156,6 +160,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Insert;
             app.insert_after = false;
             app.nibble_input = None;
+            app.change_start = Some(app.cursor_offset);
         }
         KeyCode::Char('a') => {
             app.mode = Mode::Insert;
@@ -164,10 +169,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             if !app.buffer.is_empty() {
                 app.cursor_offset = (app.cursor_offset + 1).min(app.buffer.len());
             }
+            app.change_start = Some(app.cursor_offset);
         }
         KeyCode::Char('R') => {
             app.mode = Mode::Replace;
             app.nibble_input = None;
+            app.change_start = Some(app.cursor_offset);
         }
         KeyCode::Char(':') => {
             app.mode = Mode::Command;
@@ -245,14 +252,25 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             if !app.buffer.is_empty() {
                 let count = app.count_prefix.take().unwrap_or(1);
                 app.undo_manager.begin_group("delete bytes");
+                let mut deleted = 0usize;
                 for _ in 0..count {
-                    if !app.buffer.is_empty() {
+                    if app.cursor_offset < app.buffer.len() {
                         editor::remove_byte(app, app.cursor_offset);
+                        deleted += 1;
                     }
                 }
                 app.undo_manager.end_group();
+                if deleted > 0 {
+                    app.last_change = Some(LastChange::Delete { len: deleted });
+                }
                 clamp_cursor(app);
             }
+        }
+
+        // 重复上次修改
+        KeyCode::Char('.') => {
+            let count = app.count_prefix.take().unwrap_or(1);
+            repeat_last_change(app, count);
         }
 
         // Visual 模式
@@ -273,6 +291,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 let len = yank_data.len();
                 editor::insert_bytes(app, insert_pos, &yank_data);
                 app.cursor_offset = (insert_pos + len - 1).min(app.buffer.len().saturating_sub(1));
+                app.last_change = Some(LastChange::Paste);
             }
         }
 
@@ -417,6 +436,7 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
                 app.visual_anchor = None;
                 app.cursor_offset = start;
                 clamp_cursor(app);
+                app.last_change = Some(LastChange::Delete { len });
             }
         }
         _ => {}
@@ -429,6 +449,14 @@ fn handle_insert_mode(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Normal;
             app.insert_after = false;
             app.nibble_input = None;
+            // 截取本次会话插入的字节（空会话不记录，保留上次修改）
+            if let Some(start) = app.change_start.take() {
+                let end = app.cursor_offset.min(app.buffer.len());
+                if end > start {
+                    let bytes = app.buffer.get_range(start, end - start).to_vec();
+                    app.last_change = Some(LastChange::Insert { bytes });
+                }
+            }
             clamp_cursor(app);
         }
         _ => match app.active_panel {
@@ -443,6 +471,16 @@ fn handle_replace_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.mode = Mode::Normal;
             app.nibble_input = None;
+            // 截取本次会话覆盖的字节（空会话不记录，保留上次修改）
+            if let Some(start) = app.change_start.take() {
+                // 覆盖写入不增长缓冲区；若在 EOF 处提前停止，
+                // 结束位置以缓冲区长度为准（正常不会超过）
+                let end = app.cursor_offset.min(app.buffer.len());
+                if end > start {
+                    let bytes = app.buffer.get_range(start, end - start).to_vec();
+                    app.last_change = Some(LastChange::Overwrite { bytes });
+                }
+            }
         }
         _ => match app.active_panel {
             Panel::Hex => handle_hex_replace(app, key),
@@ -589,6 +627,7 @@ fn handle_single_replace(app: &mut App, key: KeyEvent) {
                         let high = app.nibble_input.take().unwrap();
                         let value = (high << 4) | nibble;
                         editor::set_byte(app, app.cursor_offset, value);
+                        app.last_change = Some(LastChange::ReplaceByte { value });
                         app.cursor_offset =
                             (app.cursor_offset + 1).min(app.buffer.len().saturating_sub(1));
                         // pending_key 保持 None（由 handle_pending_key 已清除）
@@ -601,6 +640,7 @@ fn handle_single_replace(app: &mut App, key: KeyEvent) {
                 if let KeyCode::Char(c) = key.code {
                     if c.is_ascii_graphic() || c == ' ' {
                         editor::set_byte(app, app.cursor_offset, c as u8);
+                        app.last_change = Some(LastChange::ReplaceByte { value: c as u8 });
                         app.cursor_offset =
                             (app.cursor_offset + 1).min(app.buffer.len().saturating_sub(1));
                     }
@@ -732,9 +772,9 @@ fn page_up(app: &mut App) {
     app.cursor_offset = app.cursor_offset.saturating_sub(page_bytes);
 }
 
-fn delete_line(app: &mut App) {
+fn delete_line(app: &mut App) -> usize {
     if app.buffer.is_empty() {
-        return;
+        return 0;
     }
     let row_start = app.cursor_offset / 16 * 16;
     let row_end = (row_start + 16).min(app.buffer.len());
@@ -747,11 +787,101 @@ fn delete_line(app: &mut App) {
     app.undo_manager.end_group();
 
     clamp_cursor(app);
+    count
 }
 
 fn clamp_cursor(app: &mut App) {
     if !app.buffer.is_empty() && app.cursor_offset >= app.buffer.len() {
         app.cursor_offset = app.buffer.len().saturating_sub(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `.` 重复上次修改（支持数字前缀，重放不改变 last_change）
+// ---------------------------------------------------------------------------
+fn repeat_last_change(app: &mut App, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let change = match &app.last_change {
+        Some(c) => c.clone(),
+        None => return,
+    };
+
+    match change {
+        LastChange::Insert { bytes } => {
+            if bytes.is_empty() {
+                return;
+            }
+            let mut repeated = Vec::with_capacity(bytes.len() * count);
+            for _ in 0..count {
+                repeated.extend_from_slice(&bytes);
+            }
+            let pos = app.cursor_offset.min(app.buffer.len());
+            editor::insert_bytes(app, pos, &repeated);
+            // 与插入会话退出后的光标位置语义一致：停留在插入内容之后（钳制到文件尾最后一个字节）
+            if !app.buffer.is_empty() {
+                app.cursor_offset = (pos + repeated.len()).min(app.buffer.len() - 1);
+            }
+        }
+        LastChange::Overwrite { bytes } => {
+            if bytes.is_empty() || app.cursor_offset >= app.buffer.len() {
+                return;
+            }
+            let mut repeated = Vec::with_capacity(bytes.len() * count);
+            for _ in 0..count {
+                repeated.extend_from_slice(&bytes);
+            }
+            // 钳制到文件尾，超出部分截断
+            repeated.truncate(app.buffer.len() - app.cursor_offset);
+            app.undo_manager.begin_group("overwrite bytes");
+            for (i, &b) in repeated.iter().enumerate() {
+                editor::set_byte(app, app.cursor_offset + i, b);
+            }
+            app.undo_manager.end_group();
+            // 与 R 模式光标语义一致：越过覆盖内容（钳制到文件尾最后一个字节）
+            app.cursor_offset = (app.cursor_offset + repeated.len())
+                .min(app.buffer.len().saturating_sub(1));
+        }
+        LastChange::ReplaceByte { value } => {
+            if app.cursor_offset >= app.buffer.len() {
+                return;
+            }
+            let n = count.min(app.buffer.len() - app.cursor_offset);
+            app.undo_manager.begin_group("replace bytes");
+            for i in 0..n {
+                editor::set_byte(app, app.cursor_offset + i, value);
+            }
+            app.undo_manager.end_group();
+            // 与 r 命令光标语义一致：越过被替换字节（钳制到文件尾最后一个字节）
+            app.cursor_offset = (app.cursor_offset + n)
+                .min(app.buffer.len().saturating_sub(1));
+        }
+        LastChange::Delete { len } => {
+            if len == 0 || app.cursor_offset >= app.buffer.len() {
+                return;
+            }
+            let total = len.saturating_mul(count).min(app.buffer.len() - app.cursor_offset);
+            if total == 0 {
+                return;
+            }
+            editor::remove_range(app, app.cursor_offset, total);
+            clamp_cursor(app);
+        }
+        LastChange::Paste => {
+            if app.yank_buffer.is_empty() {
+                return;
+            }
+            let yank_data = app.yank_buffer.clone();
+            let mut repeated = Vec::with_capacity(yank_data.len() * count);
+            for _ in 0..count {
+                repeated.extend_from_slice(&yank_data);
+            }
+            let insert_pos = if app.buffer.is_empty() { 0 } else { app.cursor_offset + 1 };
+            editor::insert_bytes(app, insert_pos, &repeated);
+            app.cursor_offset = (insert_pos + repeated.len() - 1)
+                .min(app.buffer.len().saturating_sub(1));
+        }
     }
 }
 
@@ -1272,6 +1402,166 @@ mod tests {
         assert_eq!(app.history_index, None, "进入 Search 模式时应重置浏览位置");
         let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.search_input, "world", "Up 应载入最近一条搜索词");
+    }
+
+    // -----------------------------------------------------------------------
+    // `.` 重复上次修改回归测试（Task #17）
+    // -----------------------------------------------------------------------
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    /// 模拟 Hex 面板插入会话：i + 十六进制数字 + Esc（默认 active_panel 为 Hex）
+    fn insert_session(app: &mut App, hex_digits: &str) {
+        let _ = handle_input(app, key('i'));
+        for d in hex_digits.chars() {
+            let _ = handle_input(app, key(d));
+        }
+        let _ = handle_input(app, esc());
+    }
+
+    fn dot(app: &mut App) {
+        let _ = handle_input(app, key('.'));
+    }
+
+    /// 插入会话后 `.` 重复插入相同字节；连续 `.` 重复同一修改（重放不改变 last_change）
+    #[test]
+    fn dot_repeats_insert_session() {
+        let mut app = app_with_data(&[0u8; 8]);
+        insert_session(&mut app, "abcd"); // 插入 0xAB 0xCD，缓冲区变为 10 字节
+        assert_eq!(app.buffer.data(), &[0xAB, 0xCD, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(app.cursor_offset, 2, "插入会话退出后光标停留在插入内容之后");
+
+        dot(&mut app);
+        assert_eq!(
+            app.buffer.data(),
+            &[0xAB, 0xCD, 0xAB, 0xCD, 0, 0, 0, 0, 0, 0, 0, 0],
+            ". 应在光标处重复插入会话字节"
+        );
+        assert_eq!(
+            app.last_change,
+            Some(LastChange::Insert { bytes: vec![0xAB, 0xCD] }),
+            "重放不应改变 last_change"
+        );
+
+        dot(&mut app);
+        assert_eq!(
+            app.buffer.data(),
+            &[0xAB, 0xCD, 0xAB, 0xCD, 0xAB, 0xCD, 0, 0, 0, 0, 0, 0, 0, 0],
+            "连续 . 应重复同一修改"
+        );
+    }
+
+    /// `3x` 后 `.` 再删 1 字节，`2.` 删 2 字节（count 前缀生效）
+    #[test]
+    fn dot_repeats_delete_with_count() {
+        let mut app = app_with_data(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let _ = handle_input(&mut app, key('3'));
+        let _ = handle_input(&mut app, key('x'));
+        assert_eq!(app.buffer.data(), &[4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(app.last_change, Some(LastChange::Delete { len: 3 }));
+
+        dot(&mut app);
+        assert_eq!(app.buffer.data(), &[7, 8, 9, 10], ". 应再删 3 字节");
+    }
+
+    /// `2.` 带数字前缀重复删除：删除长度乘以 count
+    #[test]
+    fn dot_with_count_prefix_multiplies_delete() {
+        let mut app = app_with_data(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let _ = handle_input(&mut app, key('3'));
+        let _ = handle_input(&mut app, key('x'));
+        assert_eq!(app.buffer.data(), &[4, 5, 6, 7, 8, 9, 10]);
+
+        let _ = handle_input(&mut app, key('2'));
+        dot(&mut app);
+        assert_eq!(app.buffer.data(), &[10], "2. 应删除 3*2=6 字节");
+    }
+
+    /// `r` 单字节替换后 `.` 重复替换后续字节（钳制到文件尾）
+    #[test]
+    fn dot_repeats_single_replace() {
+        let mut app = app_with_data(&[0, 0, 0]);
+        let _ = handle_input(&mut app, key('r'));
+        let _ = handle_input(&mut app, key('f'));
+        let _ = handle_input(&mut app, key('f'));
+        assert_eq!(app.buffer.data(), &[0xFF, 0, 0]);
+        assert_eq!(app.last_change, Some(LastChange::ReplaceByte { value: 0xFF }));
+
+        dot(&mut app);
+        assert_eq!(app.buffer.data(), &[0xFF, 0xFF, 0], ". 应用相同值替换光标处字节");
+        dot(&mut app);
+        assert_eq!(app.buffer.data(), &[0xFF, 0xFF, 0xFF]);
+        dot(&mut app); // 已到文件尾，不 panic 且不再变化（钳制）
+        assert_eq!(app.buffer.data(), &[0xFF, 0xFF, 0xFF]);
+    }
+
+    /// `p` 粘贴后 `.` 再次粘贴（使用当前 yank_buffer）
+    #[test]
+    fn dot_repeats_paste() {
+        let mut app = app_with_data(&[1, 2, 3]);
+        app.yank_buffer = vec![9];
+        app.cursor_offset = 0;
+
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.data(), &[1, 9, 2, 3]);
+
+        dot(&mut app);
+        assert_eq!(app.buffer.data(), &[1, 9, 9, 2, 3], ". 应在光标后再次粘贴");
+    }
+
+    /// 空插入会话（i 后直接 Esc）不记录，`.` 保持上一次修改
+    #[test]
+    fn empty_insert_session_keeps_last_change() {
+        let mut app = app_with_data(&[0u8; 4]);
+        insert_session(&mut app, "ab"); // 记录 Insert{[0xAB]}
+        assert_eq!(app.last_change, Some(LastChange::Insert { bytes: vec![0xAB] }));
+
+        // 空会话：i 后直接 Esc
+        let _ = handle_input(&mut app, key('i'));
+        let _ = handle_input(&mut app, esc());
+        assert_eq!(
+            app.last_change,
+            Some(LastChange::Insert { bytes: vec![0xAB] }),
+            "空会话不应覆盖 last_change"
+        );
+
+        let before = app.buffer.data().to_vec();
+        dot(&mut app); // 仍重放上一次的插入（空会话未覆盖记录）
+        assert_eq!(app.buffer.data().len(), before.len() + 1);
+    }
+
+    /// 文件尾钳制：`2x` 超出剩余长度时只记录实际删除长度；
+    /// 清空文件后 `.` 不 panic、无副作用
+    #[test]
+    fn dot_at_eof_does_not_panic() {
+        let mut app = app_with_data(&[7]);
+        let _ = handle_input(&mut app, key('2')); // 2x 超出剩余长度，实际只删 1 字节
+        let _ = handle_input(&mut app, key('x'));
+        assert!(app.buffer.is_empty());
+        assert_eq!(app.last_change, Some(LastChange::Delete { len: 1 }));
+
+        dot(&mut app); // 光标已在 EOF，不 panic、无变化
+        assert!(app.buffer.is_empty());
+    }
+
+    /// 重放整体作为一个 undo 组：一次 `u` 即可完全撤销 `.` 的效果
+    #[test]
+    fn dot_replay_is_single_undo_group() {
+        let mut app = app_with_data(&[0u8; 8]);
+        insert_session(&mut app, "abcd");
+        let after_session = app.buffer.data().to_vec();
+
+        dot(&mut app);
+        assert_ne!(app.buffer.data(), &after_session[..]);
+
+        editor::undo(&mut app);
+        assert_eq!(app.buffer.data(), &after_session[..], "一次 undo 应完整撤销重放");
     }
 }
 
