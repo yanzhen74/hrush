@@ -79,6 +79,7 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: "n", description: "Jump to next match" },
             HelpEntry { key: "N", description: "Jump to previous match" },
             HelpEntry { key: "x:AABB", description: "Search by hex pattern (e.g. x:FF00AABB)" },
+            HelpEntry { key: "x:AA??BB", description: "Wildcard bytes (?? matches any byte)" },
             HelpEntry { key: "plain text", description: "Search by ASCII text (default)" },
             HelpEntry { key: "Esc", description: "Cancel running async search" },
             HelpEntry { key: "", description: "Progress bar shown during async search" },

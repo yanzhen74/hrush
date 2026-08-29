@@ -7,20 +7,30 @@ use crate::editor;
 
 #[derive(Clone, Debug)]
 pub enum SearchPattern {
-    Hex(Vec<u8>),
+    /// hex 模式：Some(b) 必须匹配，None 为通配字节（`??`）
+    Hex(Vec<Option<u8>>),
     Ascii(Vec<u8>),
 }
 
 impl SearchPattern {
-    pub fn as_bytes(&self) -> &[u8] {
+    /// 展开为逐字节模式：Some(b) 必须匹配，None 为通配字节
+    pub fn pattern(&self) -> Vec<Option<u8>> {
         match self {
-            SearchPattern::Hex(b) => b,
-            SearchPattern::Ascii(b) => b,
+            SearchPattern::Hex(b) => b.clone(),
+            SearchPattern::Ascii(b) => b.iter().map(|&x| Some(x)).collect(),
         }
     }
 
+    /// 无通配时返回原始字节（可直接用于精确比较）
+    pub fn exact_bytes(&self) -> Option<Vec<u8>> {
+        self.pattern().into_iter().collect()
+    }
+
     pub fn len(&self) -> usize {
-        self.as_bytes().len()
+        match self {
+            SearchPattern::Hex(b) => b.len(),
+            SearchPattern::Ascii(b) => b.len(),
+        }
     }
 
     #[allow(dead_code)]
@@ -77,7 +87,8 @@ impl SearchState {
 
         self.pattern = Some(pattern.clone());
 
-        let pat_bytes: Vec<u8> = pattern.as_bytes().to_vec();
+        // 无通配时走原有精确匹配的快路径，行为与性能完全不变
+        let exact_bytes = pattern.exact_bytes();
         let total = if data.len() >= pat_len {
             data.len() - pat_len + 1
         } else {
@@ -97,6 +108,8 @@ impl SearchState {
         let progress = Arc::clone(&self.progress);
         let cancel_flag = Arc::clone(&self.cancel_flag);
 
+        let pat = pattern.pattern();
+
         let handle = thread::spawn(move || {
             let mut matches = Vec::new();
             let data_len = data.len();
@@ -111,8 +124,17 @@ impl SearchState {
                 }
 
                 // 线性匹配
-                if data[i..].starts_with(&pat_bytes) {
-                    matches.push(i);
+                match &exact_bytes {
+                    Some(pat_bytes) => {
+                        if data[i..].starts_with(pat_bytes) {
+                            matches.push(i);
+                        }
+                    }
+                    None => {
+                        if matches_at(&data, i, &pat) {
+                            matches.push(i);
+                        }
+                    }
                 }
 
                 // 每 4096 字节更新一次进度
@@ -323,12 +345,12 @@ pub fn replace_all(app: &mut App, old: &SearchPattern, new_bytes: &[u8]) -> Resu
 
     let mut matches = Vec::new();
     let buf_len = app.buffer.len();
-    let pat = old.as_bytes();
+    let pat = old.pattern();
 
     if old_len <= buf_len {
         for i in 0..=buf_len - old_len {
             let window = app.buffer.get_range(i, old_len);
-            if window == pat {
+            if matches_at(&window, 0, &pat) {
                 matches.push(i);
             }
         }
@@ -370,8 +392,21 @@ pub fn replace_all(app: &mut App, old: &SearchPattern, new_bytes: &[u8]) -> Resu
     Ok(())
 }
 
+/// 判断 data 在 offset 处是否匹配模式（None 为通配字节）
+pub fn matches_at(data: &[u8], offset: usize, pat: &[Option<u8>]) -> bool {
+    for j in 0..pat.len() {
+        if let Some(b) = pat[j] {
+            if data[offset + j] != b {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// 解析搜索/替换文本
-/// 以 `x:` 开头为 hex 模式（如 `x:AABB`），否则为 ASCII
+/// 以 `x:` 开头为 hex 模式（如 `x:AABB`），否则为 ASCII；
+/// hex 模式中 `??` 为通配字节（如 `x:AA??BB`）
 pub fn parse_pattern(input: &str) -> Result<SearchPattern> {
     if input.starts_with("x:") || input.starts_with("X:") {
         let hex_str = &input[2..];
@@ -384,9 +419,17 @@ pub fn parse_pattern(input: &str) -> Result<SearchPattern> {
         }
         let mut bytes = Vec::with_capacity(cleaned.len() / 2);
         for i in (0..cleaned.len()).step_by(2) {
-            let byte = u8::from_str_radix(&cleaned[i..i + 2], 16)
+            let pair = &cleaned[i..i + 2];
+            if pair == "??" {
+                bytes.push(None);
+                continue;
+            }
+            if pair.contains('?') {
+                bail!("Invalid wildcard: use ?? for a full byte");
+            }
+            let byte = u8::from_str_radix(pair, 16)
                 .map_err(|e| anyhow::anyhow!("Invalid hex: {}", e))?;
-            bytes.push(byte);
+            bytes.push(Some(byte));
         }
         Ok(SearchPattern::Hex(bytes))
     } else {
@@ -394,7 +437,91 @@ pub fn parse_pattern(input: &str) -> Result<SearchPattern> {
     }
 }
 
-/// 解析替换内容，逻辑与 parse_pattern 相同，但直接返回字节
+/// 解析替换内容，逻辑与 parse_pattern 相同，但直接返回字节（不允许通配）
 pub fn parse_replacement(input: &str) -> Result<Vec<u8>> {
-    parse_pattern(input).map(|pat| pat.as_bytes().to_vec())
+    let bytes = parse_pattern(input)?.pattern()
+        .into_iter()
+        .collect::<Option<Vec<u8>>>();
+    bytes.ok_or_else(|| anyhow::anyhow!("Wildcards not allowed in replacement"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 同步执行一次搜索并返回匹配位置（内部仍走异步线程 + poll）
+    fn run_search(data: Vec<u8>, pattern: SearchPattern) -> Vec<usize> {
+        let mut state = SearchState::new();
+        state.start_search(data, pattern);
+        while !state.poll_result() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        state.matches
+    }
+
+    #[test]
+    fn wildcard_matches_any_byte() {
+        let pat = parse_pattern("x:41??43").unwrap();
+        assert_eq!(run_search(vec![0x41, 0x00, 0x43], pat.clone()), vec![0]);
+        assert_eq!(run_search(vec![0x41, 0xFF, 0x43], pat.clone()), vec![0]);
+        assert!(run_search(vec![0x41, 0x00, 0x44], pat).is_empty());
+    }
+
+    #[test]
+    fn full_wildcard_matches_any_bytes() {
+        let pat = parse_pattern("x:????").unwrap();
+        assert_eq!(run_search(vec![0x12, 0x34, 0x56], pat), vec![0, 1]);
+    }
+
+    #[test]
+    fn exact_hex_behavior_unchanged() {
+        let pat = parse_pattern("x:AABB").unwrap();
+        assert_eq!(run_search(vec![0x00, 0xAA, 0xBB, 0xAA, 0xBB], pat), vec![1, 3]);
+    }
+
+    #[test]
+    fn ascii_mode_no_wildcards() {
+        let pat = parse_pattern("a?b").unwrap();
+        match &pat {
+            SearchPattern::Ascii(b) => assert_eq!(b, b"a?b"),
+            _ => panic!("expected Ascii pattern"),
+        }
+        // `?` 在 ASCII 模式按字面量匹配，不通配：匹配含字面 `?` 的数据，不匹配其他字节
+        assert_eq!(run_search(b"a?b".to_vec(), pat.clone()), vec![0]);
+        assert!(run_search(b"axb".to_vec(), pat).is_empty());
+    }
+
+    #[test]
+    fn invalid_patterns_error_without_panic() {
+        assert!(parse_pattern("x:4?").is_err()); // 半字节通配
+        assert!(parse_pattern("x:?4").is_err());
+        assert!(parse_pattern("x:GG").is_err()); // 非法 hex
+        assert!(parse_pattern("x:A").is_err()); // 奇数长度
+        assert!(parse_pattern("x:").is_err()); // 空模式不搜索
+    }
+
+    #[test]
+    fn replacement_rejects_wildcards() {
+        assert!(parse_replacement("x:AA??BB").is_err());
+        assert_eq!(parse_replacement("x:AABB").unwrap(), vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn parse_wildcard_pattern_structure() {
+        match parse_pattern("x:AA??BB").unwrap() {
+            SearchPattern::Hex(b) => {
+                assert_eq!(b, vec![Some(0xAA), None, Some(0xBB)]);
+            }
+            _ => panic!("expected Hex pattern"),
+        }
+    }
+
+    #[test]
+    fn whitespace_in_hex_pattern_allowed() {
+        let pat = parse_pattern("x:AA ?? BB").unwrap();
+        match pat {
+            SearchPattern::Hex(b) => assert_eq!(b, vec![Some(0xAA), None, Some(0xBB)]),
+            _ => panic!("expected Hex pattern"),
+        }
+    }
 }
