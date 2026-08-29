@@ -5,3 +5,6 @@
 /.tmp-release
 /hrush/
 hrush-v*-windows-x86_64.zip
+hrush-v*-windows7-x86_64.zip
+hrush-v*-linux-x86_64
+.gitignore

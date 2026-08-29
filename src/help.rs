@@ -34,6 +34,9 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: "G", description: "Jump to end of file" },
             HelpEntry { key: "Ctrl+F / PageDown", description: "Page down (jump forward one screen)" },
             HelpEntry { key: "Ctrl+B / PageUp", description: "Page up (jump backward one screen)" },
+            HelpEntry { key: "Ctrl+O", description: "Jump back to previous location (jumplist)" },
+            HelpEntry { key: "Tab", description: "Jump forward to next location (jumplist)" },
+            HelpEntry { key: "Ctrl+W", description: "Switch between Hex and ASCII panel" },
             HelpEntry { key: "{N}<motion>", description: "Repeat motion N times (e.g. 3l, 5h, 10j)" },
         ],
     },
@@ -50,7 +53,7 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: "p", description: "Paste yanked/deleted bytes after cursor" },
             HelpEntry { key: "u", description: "Undo last change" },
             HelpEntry { key: "Ctrl+R", description: "Redo last undone change" },
-            HelpEntry { key: "Tab", description: "Toggle between Hex and ASCII panel" },
+            HelpEntry { key: "Ctrl+W", description: "Toggle between Hex and ASCII panel" },
         ],
     },
     HelpSection {

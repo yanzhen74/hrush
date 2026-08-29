@@ -92,7 +92,12 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         "goto" | "g" => {
             if parts.len() >= 2 {
                 let offset = parse_offset(parts[1])?;
-                app.cursor_offset = offset.min(app.buffer.len().saturating_sub(1));
+                // 跳转前记录当前光标位置到 jumplist（偏移有变化时才入栈）
+                let target = offset.min(app.buffer.len().saturating_sub(1));
+                if target != app.cursor_offset {
+                    app.push_jump();
+                }
+                app.cursor_offset = target;
             }
         }
         "help" | "h" => {

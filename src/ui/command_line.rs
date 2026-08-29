@@ -50,7 +50,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled(":", Style::default().fg(Color::Yellow)),
                     Span::raw(":Command  "),
                     Span::styled("v", Style::default().fg(Color::Yellow)),
-                    Span::raw(":Visual"),
+                    Span::raw(":Visual  "),
+                    Span::styled("Ctrl+W", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Panel  "),
+                    Span::styled("Ctrl+O/Tab", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Back/Fwd"),
                 ]);
                 let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
                 frame.render_widget(paragraph, area);

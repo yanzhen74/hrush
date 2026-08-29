@@ -44,18 +44,25 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
         'g' => {
             if key.code == KeyCode::Char('g') {
                 if app.is_frame_mode() {
-                    if let Some(fi) = &app.frame_index {
-                        if !fi.frames.is_empty() {
-                            let current_frame_num = app.current_frame_number().unwrap_or(0);
-                            let current_frame = &fi.frames[current_frame_num];
-                            let col = app.cursor_offset.saturating_sub(current_frame.offset);
-                            let first_frame = &fi.frames[0];
-                            let target_col = col.min(first_frame.length.saturating_sub(1));
-                            app.cursor_offset = first_frame.offset + target_col;
-                            app.scroll_offset = 0;
+                    // 先计算跳转目标，结束 frame_index 的不可变借用后再记录跳转点
+                    let target = app.frame_index.as_ref().and_then(|fi| {
+                        if fi.frames.is_empty() {
+                            return None;
                         }
+                        let current_frame_num = app.current_frame_number()?;
+                        let current_frame = &fi.frames[current_frame_num];
+                        let col = app.cursor_offset.saturating_sub(current_frame.offset);
+                        let first_frame = &fi.frames[0];
+                        let target_col = col.min(first_frame.length.saturating_sub(1));
+                        Some(first_frame.offset + target_col)
+                    });
+                    if let Some(offset) = target {
+                        app.push_jump();
+                        app.cursor_offset = offset;
+                        app.scroll_offset = 0;
                     }
                 } else {
+                    app.push_jump();
                     app.cursor_offset = 0;
                 }
             } else {
@@ -156,12 +163,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('n') => {
             let start = app.cursor_offset + 1;
             if let Some(offset) = app.search_state.next_match(start) {
+                app.push_jump();
                 app.cursor_offset = offset;
             }
         }
         KeyCode::Char('N') => {
             let start = app.cursor_offset.saturating_sub(1);
             if let Some(offset) = app.search_state.prev_match(start) {
+                app.push_jump();
                 app.cursor_offset = offset;
             }
         }
@@ -187,6 +196,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         // 快速移动
         KeyCode::Char('G') => {
             if !app.buffer.is_empty() {
+                app.push_jump();
                 app.cursor_offset = app.buffer.len().saturating_sub(1);
             }
         }
@@ -252,12 +262,20 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             editor::redo(app);
         }
 
-        // 面板切换
-        KeyCode::Tab => {
+        // 面板切换（原 Tab 改键为 Ctrl+W）
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.active_panel = match app.active_panel {
                 Panel::Hex => Panel::Ascii,
                 Panel::Ascii => Panel::Hex,
             };
+        }
+
+        // Jumplist：Ctrl+O 回退 / Tab 前进
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            jump_back(app);
+        }
+        KeyCode::Tab => {
+            jump_forward(app);
         }
 
         // F2 切换帧模式
@@ -655,6 +673,25 @@ fn clamp_cursor(app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
+// Jumplist 导航（Ctrl+O 回退 / Tab 前进）
+// ---------------------------------------------------------------------------
+
+fn jump_back(app: &mut App) {
+    if let Some(pos) = app.jump_back.pop() {
+        app.jump_forward.push(app.cursor_offset);
+        // 滚动视图由 App::run 主循环中的 scroll 同步逻辑自动跟随
+        app.cursor_offset = pos.min(app.buffer.len().saturating_sub(1));
+    }
+}
+
+fn jump_forward(app: &mut App) {
+    if let Some(pos) = app.jump_forward.pop() {
+        app.jump_back.push(app.cursor_offset);
+        app.cursor_offset = pos.min(app.buffer.len().saturating_sub(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 帧模式导航
 // ---------------------------------------------------------------------------
 
@@ -717,7 +754,9 @@ fn handle_frame_navigation(app: &mut App, key: KeyEvent) -> bool {
                 let col = app.cursor_offset.saturating_sub(current_frame.offset);
                 let target_frame = &frame_index.frames[target_frame_num];
                 let target_col = col.min(target_frame.length.saturating_sub(1));
-                app.cursor_offset = target_frame.offset + target_col;
+                let target_offset = target_frame.offset;
+                app.push_jump();
+                app.cursor_offset = target_offset + target_col;
                 sync_v_scroll(app);
             }
             true
@@ -729,7 +768,9 @@ fn handle_frame_navigation(app: &mut App, key: KeyEvent) -> bool {
                 let col = app.cursor_offset.saturating_sub(current_frame.offset);
                 let target_frame = &frame_index.frames[target_frame_num];
                 let target_col = col.min(target_frame.length.saturating_sub(1));
-                app.cursor_offset = target_frame.offset + target_col;
+                let target_offset = target_frame.offset;
+                app.push_jump();
+                app.cursor_offset = target_offset + target_col;
                 sync_v_scroll(app);
             }
             true
@@ -750,7 +791,12 @@ fn handle_frame_navigation(app: &mut App, key: KeyEvent) -> bool {
                 let last_idx = frame_index.frames.len() - 1;
                 let last_frame = &frame_index.frames[last_idx];
                 let target_col = col.min(last_frame.length.saturating_sub(1));
-                app.cursor_offset = last_frame.offset + target_col;
+                let target_offset = last_frame.offset;
+                let should_jump = last_idx != current_frame_num;
+                if should_jump {
+                    app.push_jump();
+                }
+                app.cursor_offset = target_offset + target_col;
                 sync_v_scroll(app);
             }
             true
@@ -852,6 +898,110 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.cursor_offset, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Jumplist 回归测试（Task #10）
+    // -----------------------------------------------------------------------
+
+    use crate::buffer::Buffer;
+
+    /// 构造带数据的 App（直接构造 Buffer 避免留下编辑/undo 记录）
+    fn app_with_data(data: &[u8]) -> App {
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(data);
+        app
+    }
+
+    /// 通过命令模式执行 :goto
+    fn goto(app: &mut App, offset: usize) {
+        app.mode = Mode::Command;
+        app.command_input = format!("goto {}", offset);
+        let _ = handle_input(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn ctrl_o() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)
+    }
+
+    fn ctrl_w() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+    }
+
+    /// 跳转后 Ctrl+O 能回到原位置，再次 Ctrl+O 继续回退
+    #[test]
+    fn ctrl_o_jumps_back_to_previous_location() {
+        let mut app = app_with_data(&[0u8; 64]);
+        app.cursor_offset = 5;
+
+        goto(&mut app, 40);
+        assert_eq!(app.cursor_offset, 40);
+
+        let _ = handle_input(&mut app, ctrl_o());
+        assert_eq!(app.cursor_offset, 5, "Ctrl+O 应回退到 :goto 前的位置");
+    }
+
+    /// 回退后 Tab 能前进恢复原位置，且恢复后前进栈为空、可再次回退
+    #[test]
+    fn tab_jumps_forward_after_back() {
+        let mut app = app_with_data(&[0u8; 64]);
+        app.cursor_offset = 5;
+
+        goto(&mut app, 40);
+
+        let _ = handle_input(&mut app, ctrl_o());
+        assert_eq!(app.cursor_offset, 5);
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.cursor_offset, 40, "Tab 应前进恢复回退前的位置");
+        assert!(app.jump_forward.is_empty());
+
+        let _ = handle_input(&mut app, ctrl_o());
+        assert_eq!(app.cursor_offset, 5, "前进后仍可通过 Ctrl+O 回退");
+    }
+
+    /// 新跳转会清空前进栈（浏览器式后退/前进语义）
+    #[test]
+    fn new_jump_clears_forward_stack() {
+        let mut app = app_with_data(&[0u8; 64]);
+        app.cursor_offset = 0;
+
+        goto(&mut app, 10);
+        goto(&mut app, 20);
+
+        // 回退一次，使前进栈非空（内容为 20）
+        let _ = handle_input(&mut app, ctrl_o());
+        assert_eq!(app.cursor_offset, 10);
+        assert_eq!(app.jump_forward, vec![20]);
+
+        // 新跳转应清空前进栈（20 不再可达）
+        goto(&mut app, 30);
+        assert!(app.jump_forward.is_empty(), "新跳转后前进栈应被清空");
+        assert_eq!(app.cursor_offset, 30);
+    }
+
+    /// Ctrl+W 切换 Hex/ASCII 面板（原 Tab 改键）
+    #[test]
+    fn ctrl_w_switches_panel() {
+        let mut app = app_with_data(&[0u8; 16]);
+        assert_eq!(app.active_panel, Panel::Hex);
+
+        let _ = handle_input(&mut app, ctrl_w());
+        assert_eq!(app.active_panel, Panel::Ascii);
+
+        let _ = handle_input(&mut app, ctrl_w());
+        assert_eq!(app.active_panel, Panel::Hex);
+    }
+
+    /// Tab 不再切换面板，前进栈为空时光标不变
+    #[test]
+    fn tab_no_longer_switches_panel() {
+        let mut app = app_with_data(&[0u8; 16]);
+        app.cursor_offset = 3;
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.active_panel, Panel::Hex, "Tab 不应再切换面板");
+        assert_eq!(app.cursor_offset, 3, "前进栈为空时光标应保持不变");
     }
 }
 

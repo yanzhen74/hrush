@@ -52,6 +52,8 @@ pub struct App {
     pub yank_buffer: Vec<u8>,
     pub help_scroll: usize,
     pub help_topic: Option<String>,
+    pub jump_back: Vec<usize>,
+    pub jump_forward: Vec<usize>,
 }
 
 impl App {
@@ -82,7 +84,21 @@ impl App {
             yank_buffer: Vec::new(),
             help_scroll: 0,
             help_topic: None,
+            jump_back: Vec::new(),
+            jump_forward: Vec::new(),
         }
+    }
+
+    /// 在执行大跳跃（:goto、搜索跳转、gg/G 等）前调用：
+    /// 把当前光标位置压入后退栈，并清空前进栈（避免连续重复入栈）
+    pub fn push_jump(&mut self) {
+        if let Some(&last) = self.jump_back.last() {
+            if last == self.cursor_offset {
+                return;
+            }
+        }
+        self.jump_back.push(self.cursor_offset);
+        self.jump_forward.clear();
     }
 
     pub fn selection_range(&self) -> Option<(usize, usize)> {
@@ -118,11 +134,15 @@ impl App {
 
             // 检查异步搜索是否完成
             if self.search_state.poll_result() {
-                // 搜索完成，自动跳转到第一个匹配
+                // 搜索完成，自动跳转到第一个匹配（跳转前记录原位置到 jumplist）
                 if let Some(offset) = self.search_state.first_match() {
+                    if offset != self.cursor_offset {
+                        self.push_jump();
+                    }
                     self.cursor_offset = offset;
                 } else if !self.search_state.matches.is_empty() {
                     if let Some(offset) = self.search_state.next_match(self.cursor_offset) {
+                        self.push_jump();
                         self.cursor_offset = offset;
                     }
                 }

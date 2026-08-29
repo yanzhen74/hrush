@@ -28,6 +28,17 @@ impl Buffer {
         }
     }
 
+    /// 用已有数据构造 Buffer（主要用于测试）
+    #[allow(dead_code)]
+    pub fn with_data(data: &[u8]) -> Self {
+        Self {
+            data: data.to_vec(),
+            modified: HashSet::new(),
+            dirty: false,
+            source: FileSource::New,
+        }
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = fs::read(path)
             .with_context(|| format!("Failed to read file: {}", path.display()))?;

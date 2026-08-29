@@ -10,7 +10,8 @@
 - **High Performance** — Written in Rust with memory-mapped file support (`mmap`) for large files.
 - **Vi-style Key Bindings** — Familiar `hjkl` navigation and modal editing for power users.
 - **Seven Modes** — Normal / Insert / Replace / Visual / Command / Search / Help.
-- **Dual-panel Editing** — Hex and ASCII views side-by-side with `Tab` to switch panels.
+- **Dual-panel Editing** — Hex and ASCII views side-by-side with `Ctrl+W` to switch panels.
+- **Jump List** — Navigate through your jump history with `Ctrl+O` (back) and `Tab` (forward), just like Vim's jumplist.
 - **Search & Replace** — Supports both hex (`x:AABB`) and ASCII patterns, with global or single replacement.
 - **Multi-step Undo / Redo** — Grouped actions with automatic merge of adjacent edits.
 - **Hex Text Import / Export** — Import hex text files and save as binary; export binary to formatted hex text.
@@ -33,7 +34,7 @@
 │ 0000001A│ CC EE AA BB 01 02 03 04  -- -- -- -- -- -- -- -- │................│
 └──────────────────────────────────────────────────────────────────────────┘
  NORMAL  example.bin | 256 B | 0x00000010 (16) [+]
- h/j/k/l move | : command | Tab switch panel
+ h/j/k/l move | : command | Ctrl+W switch panel
 ```
 
 ## Installation
@@ -87,7 +88,9 @@ hrush --import hex.txt
 | `dd` | Delete current line (16 bytes) |
 | `u` | Undo |
 | `Ctrl+R` | Redo |
-| `Tab` | Switch between Hex / ASCII panel |
+| `Ctrl+O` | Jump back to previous location |
+| `Tab` | Jump forward to next location |
+| `Ctrl+W` | Switch between Hex and ASCII panel |
 | `/` | Enter Search mode |
 | `n` | Jump to next search match |
 | `N` | Jump to previous search match |
