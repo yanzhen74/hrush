@@ -75,6 +75,7 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
         title: "Search",
         entries: &[
             HelpEntry { key: "/", description: "Enter Search mode (type pattern, Enter to start)" },
+            HelpEntry { key: "Up / Down", description: "Browse search history" },
             HelpEntry { key: "n", description: "Jump to next match" },
             HelpEntry { key: "N", description: "Jump to previous match" },
             HelpEntry { key: "x:AABB", description: "Search by hex pattern (e.g. x:FF00AABB)" },
@@ -102,6 +103,7 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: ":import FILE", description: "Import hex text file" },
             HelpEntry { key: ":export FILE", description: "Export current buffer as hex text file" },
             HelpEntry { key: ":help [topic]", description: "Open help (optional topic: overview, navigation, etc.)" },
+            HelpEntry { key: "Up / Down", description: "Browse command history" },
         ],
     },
     HelpSection {

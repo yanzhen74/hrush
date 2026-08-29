@@ -172,6 +172,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char(':') => {
             app.mode = Mode::Command;
             app.command_input.clear();
+            app.history_index = None;
         }
 
         // 搜索
@@ -179,6 +180,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Search;
             app.search_input.clear();
             app.search_state.clear();
+            app.history_index = None;
         }
         KeyCode::Char('n') => {
             let start = app.cursor_offset + 1;
@@ -453,6 +455,8 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => {
             let input = app.search_input.clone();
+            push_history(&mut app.search_history, &input);
+            app.history_index = None;
             match search::parse_pattern(&input) {
                 Ok(pattern) => {
                     let data = app.buffer.data().to_vec();
@@ -475,6 +479,12 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => {
             app.search_input.pop();
         }
+        KeyCode::Up => {
+            history_up(&app.search_history, &mut app.history_index, &mut app.search_input);
+        }
+        KeyCode::Down => {
+            history_down(&app.search_history, &mut app.history_index, &mut app.search_input);
+        }
         _ => {}
     }
 }
@@ -483,6 +493,8 @@ fn handle_command_mode(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => {
             let cmd = app.command_input.clone();
+            push_history(&mut app.command_history, &cmd);
+            app.history_index = None;
             if let Err(e) = command::execute_command(app, cmd.trim()) {
                 app.message = Some((format!("Error: {}", e), std::time::Instant::now()));
             }
@@ -503,7 +515,58 @@ fn handle_command_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => {
             app.command_input.pop();
         }
+        KeyCode::Up => {
+            history_up(&app.command_history, &mut app.history_index, &mut app.command_input);
+        }
+        KeyCode::Down => {
+            history_down(&app.command_history, &mut app.history_index, &mut app.command_input);
+        }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 命令/搜索历史（↑↓ 回溯）
+// ---------------------------------------------------------------------------
+
+/// 非空且与末条不重复时入队，上限 100 条（超出移除最旧）
+fn push_history(history: &mut Vec<String>, entry: &str) {
+    if entry.is_empty() {
+        return;
+    }
+    if history.last().map(|s| s.as_str()) == Some(entry) {
+        return;
+    }
+    history.push(entry.to_string());
+    if history.len() > 100 {
+        history.remove(0);
+    }
+}
+
+/// Up：从最新一条开始向前浏览，到头后保持不动
+fn history_up(history: &[String], index: &mut Option<usize>, input: &mut String) {
+    if history.is_empty() {
+        return;
+    }
+    let idx = match *index {
+        None => history.len() - 1,
+        Some(i) => i.saturating_sub(1),
+    };
+    *index = Some(idx);
+    *input = history[idx].clone();
+}
+
+/// Down：向后浏览，越过最新一条后清空输入并退出浏览状态
+fn history_down(history: &[String], index: &mut Option<usize>, input: &mut String) {
+    if let Some(i) = *index {
+        let next = i + 1;
+        if next >= history.len() {
+            *index = None;
+            input.clear();
+        } else {
+            *index = Some(next);
+            *input = history[next].clone();
+        }
     }
 }
 
@@ -1096,6 +1159,119 @@ mod tests {
             app.type_panel_open = false;
         }
         assert!(!app.type_panel_open, "进入 Insert 后面板应被守卫关闭");
+    }
+
+    // -----------------------------------------------------------------------
+    // 命令/搜索历史回归测试（Task #15）
+    // -----------------------------------------------------------------------
+
+    /// 执行一条命令后重新进入 Command 模式，按 Up 载入该命令
+    #[test]
+    fn up_loads_last_command_after_execution() {
+        let mut app = app_with_data(&[0u8; 64]);
+        goto(&mut app, 40);
+        assert_eq!(app.command_history, vec!["goto 40"]);
+
+        // 重新进入 Command 模式（按 :）
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Command);
+        assert!(app.command_input.is_empty());
+        assert_eq!(app.history_index, None, "进入 Command 模式时应重置浏览位置");
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.command_input, "goto 40", "Up 应载入最近一条命令");
+        assert_eq!(app.history_index, Some(0));
+    }
+
+    /// 连续 Up 不越界：到头后保持在最旧一条
+    #[test]
+    fn repeated_up_does_not_underflow() {
+        let mut app = app_with_data(&[0u8; 64]);
+        goto(&mut app, 10);
+        goto(&mut app, 20);
+        assert_eq!(app.command_history, vec!["goto 10", "goto 20"]);
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for _ in 0..5 {
+            let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        assert_eq!(app.history_index, Some(0), "连续 Up 应停在最旧一条不越界");
+        assert_eq!(app.command_input, "goto 10");
+    }
+
+    /// Down 越过最新一条后清空输入并退出浏览状态；中途 Down 载入对应历史
+    #[test]
+    fn down_past_newest_clears_input() {
+        let mut app = app_with_data(&[0u8; 64]);
+        goto(&mut app, 10);
+        goto(&mut app, 20);
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        // 无浏览状态时 Down 无操作
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.command_input.is_empty());
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let _ = handle_input(&mut app, up);
+        let _ = handle_input(&mut app, up);
+        assert_eq!(app.command_input, "goto 10");
+
+        let _ = handle_input(&mut app, down);
+        assert_eq!(app.command_input, "goto 20", "Down 应载入下一条历史");
+        assert_eq!(app.history_index, Some(1));
+
+        let _ = handle_input(&mut app, down);
+        assert!(app.command_input.is_empty(), "Down 到底后应清空输入");
+        assert_eq!(app.history_index, None);
+    }
+
+    /// 连续重复命令只存一条；空命令不入库；上限 100 条移除最旧
+    #[test]
+    fn history_dedupes_and_caps_entries() {
+        let mut app = app_with_data(&[0u8; 64]);
+        goto(&mut app, 10);
+        goto(&mut app, 10);
+        assert_eq!(app.command_history, vec!["goto 10"], "连续重复命令只存一条");
+        goto(&mut app, 20);
+
+        // 空命令不入库（直接按 Enter）
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.command_history.len(), 2);
+
+        // 填满超过 100 条后移除最旧
+        for i in 0..110 {
+            push_history(&mut app.command_history, &format!("cmd{}", i));
+        }
+        assert_eq!(app.command_history.len(), 100, "历史上限 100 条");
+        assert_eq!(app.command_history[0], "cmd10", "超出上限时移除最旧条目");
+    }
+
+    /// Search 模式：提交后 Up 能载入上次搜索词，重复提交不重复入库
+    #[test]
+    fn search_history_up_loads_last_query() {
+        let mut app = app_with_data(b"hello world");
+        app.mode = Mode::Search;
+        app.search_input = "world".to_string();
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.search_history, vec!["world"]);
+        assert_eq!(app.mode, Mode::Normal);
+
+        // 重复提交相同搜索词不重复入库（先模拟异步搜索结果回收）
+        let _ = app.search_state.poll_result();
+        app.mode = Mode::Search;
+        app.search_input = "world".to_string();
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.search_history.len(), 1, "连续重复搜索词只存一条");
+        let _ = app.search_state.poll_result();
+
+        // 按 / 重新进入 Search 模式，Up 载入上次搜索词
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Search);
+        assert_eq!(app.history_index, None, "进入 Search 模式时应重置浏览位置");
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.search_input, "world", "Up 应载入最近一条搜索词");
     }
 }
 

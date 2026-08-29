@@ -56,6 +56,9 @@ pub struct App {
     pub jump_forward: Vec<usize>,
     pub type_panel_open: bool,
     pub type_endian_le: bool,
+    pub command_history: Vec<String>,
+    pub search_history: Vec<String>,
+    pub history_index: Option<usize>,
 }
 
 impl App {
@@ -90,6 +93,9 @@ impl App {
             jump_forward: Vec::new(),
             type_panel_open: false,
             type_endian_le: true,
+            command_history: Vec::new(),
+            search_history: Vec::new(),
+            history_index: None,
         }
     }
 
