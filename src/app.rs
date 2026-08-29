@@ -54,6 +54,8 @@ pub struct App {
     pub help_topic: Option<String>,
     pub jump_back: Vec<usize>,
     pub jump_forward: Vec<usize>,
+    pub type_panel_open: bool,
+    pub type_endian_le: bool,
 }
 
 impl App {
@@ -86,6 +88,8 @@ impl App {
             help_topic: None,
             jump_back: Vec::new(),
             jump_forward: Vec::new(),
+            type_panel_open: false,
+            type_endian_le: true,
         }
     }
 
@@ -150,6 +154,11 @@ impl App {
             
             terminal.draw(|frame| ui::draw(frame, self))?;
             self.handle_events()?;
+
+            // 切入 Insert/Command 等非 Normal 模式时自动关闭类型解读面板
+            if self.mode != Mode::Normal && self.type_panel_open {
+                self.type_panel_open = false;
+            }
 
             // 事件处理后再更新 scroll_offset，确保 cursor_offset 变化后立即同步
             if self.is_frame_mode() {

@@ -9,6 +9,7 @@ mod frame;
 mod help;
 mod import;
 mod input;
+mod interpret;
 mod large_file;
 mod ui;
 mod search;

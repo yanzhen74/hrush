@@ -51,6 +51,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                     Span::raw(":Command  "),
                     Span::styled("v", Style::default().fg(Color::Yellow)),
                     Span::raw(":Visual  "),
+                    Span::styled("t", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Types  "),
                     Span::styled("Ctrl+W", Style::default().fg(Color::Yellow)),
                     Span::raw(":Panel  "),
                     Span::styled("Ctrl+O/Tab", Style::default().fg(Color::Yellow)),

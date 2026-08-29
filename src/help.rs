@@ -17,6 +17,7 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: "hrush", description: "A hex editor TUI inspired by vim, written in Rust" },
             HelpEntry { key: "", description: "Seven modes: Normal, Insert, Replace, Command, Search, Visual, Help" },
             HelpEntry { key: "", description: "Supports hex editing, ASCII editing, frame analysis, search/replace" },
+            HelpEntry { key: "", description: "Type inspector decodes bytes at cursor as integers, floats, string, hex" },
             HelpEntry { key: "", description: "Use :help <topic> to jump to a specific topic" },
         ],
     },
@@ -101,6 +102,17 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: ":import FILE", description: "Import hex text file" },
             HelpEntry { key: ":export FILE", description: "Export current buffer as hex text file" },
             HelpEntry { key: ":help [topic]", description: "Open help (optional topic: overview, navigation, etc.)" },
+        ],
+    },
+    HelpSection {
+        id: "types",
+        title: "Type Inspector",
+        entries: &[
+            HelpEntry { key: "t", description: "Open type inspector panel (decode bytes at cursor)" },
+            HelpEntry { key: "h/j/k/l", description: "Move cursor while panel stays open (live update)" },
+            HelpEntry { key: "e", description: "Toggle endianness (little <-> big)" },
+            HelpEntry { key: "q / Esc", description: "Close type inspector panel" },
+            HelpEntry { key: "", description: "Shows u8/i8 .. u64/i64, f32/f64, string and hex at cursor" },
         ],
     },
     HelpSection {

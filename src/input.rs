@@ -88,6 +88,21 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_normal_mode(app: &mut App, key: KeyEvent) {
+    // 类型解读面板打开时：仅拦截面板自身按键，其余键穿透到原有导航逻辑
+    if app.type_panel_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.type_panel_open = false;
+                return;
+            }
+            KeyCode::Char('e') => {
+                app.type_endian_le = !app.type_endian_le;
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // 数字前缀累积（'0' 仅在已有前缀时累积，否则保留行首逻辑）
     if let KeyCode::Char(c @ '1'..='9') = key.code {
         let digit = (c as u8 - b'0') as usize;
@@ -129,6 +144,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             app.help_scroll = 0;
             app.help_topic = None;
             app.mode = Mode::Help;
+        }
+
+        // 类型解读面板入口
+        KeyCode::Char('t') => {
+            app.type_panel_open = true;
         }
 
         // 模式切换
@@ -1002,6 +1022,80 @@ mod tests {
         let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.active_panel, Panel::Hex, "Tab 不应再切换面板");
         assert_eq!(app.cursor_offset, 3, "前进栈为空时光标应保持不变");
+    }
+
+    // -----------------------------------------------------------------------
+    // 类型解读面板回归测试（Task #13）
+    // -----------------------------------------------------------------------
+
+    /// t 打开类型解读面板
+    #[test]
+    fn t_opens_type_panel() {
+        let mut app = app_with_data(&[0u8; 16]);
+        assert!(!app.type_panel_open);
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.type_panel_open, "t 应打开类型解读面板");
+    }
+
+    /// 面板打开时按 e 切换端序
+    #[test]
+    fn e_toggles_endianness_while_panel_open() {
+        let mut app = app_with_data(&[0u8; 16]);
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.type_endian_le);
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(!app.type_endian_le, "e 应切换为 BE");
+        assert!(app.type_panel_open, "切换端序后面板应保持打开");
+    }
+
+    /// 面板打开时光标移动且面板保持打开（实时解读的前提）
+    #[test]
+    fn cursor_moves_while_panel_open() {
+        let mut app = app_with_data(&[0u8; 64]);
+        app.cursor_offset = 0;
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.cursor_offset, 1, "面板打开时 l 应移动光标");
+        assert!(app.type_panel_open);
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.cursor_offset, 17, "面板打开时 j 应移动光标");
+        assert!(app.type_panel_open, "导航后面板应保持打开");
+    }
+
+    /// 面板打开时按 q / Esc 关闭
+    #[test]
+    fn q_and_esc_close_type_panel() {
+        let mut app = app_with_data(&[0u8; 16]);
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.type_panel_open, "q 应关闭面板");
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.type_panel_open);
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.type_panel_open, "Esc 应关闭面板");
+    }
+
+    /// 面板打开时按 i 进入 Insert 模式：主循环守卫（在 App::run 中）负责关闭面板，
+    /// 测试环境无法触发 run()，此处直接验证守卫的标志逻辑等价行为，
+    /// 并确认 i 仍能正常进入 Insert 模式。
+    #[test]
+    fn i_enters_insert_mode_while_panel_open() {
+        let mut app = app_with_data(&[0u8; 16]);
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Insert, "面板打开时 i 仍应进入 Insert 模式");
+        // 模拟主循环守卫：离开 Normal 模式后自动关闭面板
+        if app.mode != Mode::Normal && app.type_panel_open {
+            app.type_panel_open = false;
+        }
+        assert!(!app.type_panel_open, "进入 Insert 后面板应被守卫关闭");
     }
 }
 

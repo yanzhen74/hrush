@@ -7,6 +7,7 @@ mod command_line;
 mod hex_view;
 mod help_view;
 mod status_bar;
+mod type_view;
 pub mod frame_view;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,6 +44,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
             &app.search_state,
             app.selection_range(),
         );
+    }
+
+    // 类型解读面板浮层（仅 Normal 相关视图下显示）
+    if app.mode != Mode::Help && app.type_panel_open {
+        type_view::draw(frame, layout[0], app);
     }
 
     status_bar::draw(frame, layout[1], app);
