@@ -442,6 +442,12 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
         }
     }
 
+    // 帧模式下复用帧导航逻辑（与 Normal 模式一致，按帧行宽/帧边界移动，
+    // 避免落入下方写死 16 字节行宽的通用移动）
+    if handle_frame_navigation(app, key) {
+        return;
+    }
+
     let count = app.count_prefix.take().unwrap_or(1);
 
     match key.code {
@@ -1801,6 +1807,59 @@ mod tests {
         assert_eq!(app.match_list_sel, 0, "新搜索后选中应重置");
         assert_eq!(app.match_list_scroll, 0);
         assert_eq!(app.search_state.matches.len(), 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // frame 模式 Visual 回归测试（Task #22）
+    // -----------------------------------------------------------------------
+
+    /// 构造定长帧模式的 App（32 字节/帧）
+    fn app_with_frames(data: &[u8], frame_len: usize) -> App {
+        let mut app = app_with_data(data);
+        let index = crate::frame::build_frame_index(
+            app.buffer.data(),
+            &crate::frame::FrameConfig::FixedLength { length: frame_len },
+        );
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+        app
+    }
+
+    /// frame 模式下 Visual 模式 j/k 应按帧行宽（32 字节）移动，而非固定 16 字节
+    #[test]
+    fn visual_jk_moves_by_frame_width_in_frame_mode() {
+        let mut app = app_with_frames(&[0u8; 96], 32);
+        app.cursor_offset = 0;
+
+        let _ = handle_input(&mut app, key('v'));
+        assert_eq!(app.mode, Mode::Visual);
+
+        let _ = handle_input(&mut app, key('j'));
+        assert_eq!(app.cursor_offset, 32, "j 应移动到下一帧同列（步长=帧宽 32）");
+
+        let _ = handle_input(&mut app, key('k'));
+        assert_eq!(app.cursor_offset, 0, "k 应回到上一帧同列");
+    }
+
+    /// frame 模式下 Visual 移动后 selection_range 应覆盖锚点到光标；
+    /// 0/$ 按帧边界定位而非 16 字节行边界
+    #[test]
+    fn visual_selection_range_in_frame_mode() {
+        let mut app = app_with_frames(&[0u8; 96], 32);
+        app.cursor_offset = 2;
+
+        let _ = handle_input(&mut app, key('v'));
+        let _ = handle_input(&mut app, key('j'));
+        assert_eq!(app.cursor_offset, 34);
+        assert_eq!(app.selection_range(), Some((2, 34)), "选区应覆盖锚点到光标");
+
+        let _ = handle_input(&mut app, key('$'));
+        assert_eq!(app.cursor_offset, 63, "$ 应定位到当前帧最后一字节");
+        assert_eq!(app.selection_range(), Some((2, 63)));
+
+        let _ = handle_input(&mut app, key('0'));
+        assert_eq!(app.cursor_offset, 32, "0 应定位到当前帧首字节");
+        assert_eq!(app.selection_range(), Some((2, 32)));
     }
 }
 

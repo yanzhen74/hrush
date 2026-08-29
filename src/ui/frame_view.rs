@@ -53,6 +53,9 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
     // 光标所在帧索引
     let cursor_frame_idx = app.current_frame_number();
 
+    // Visual 选区（与 hex_view 一致，选区内字节高亮）
+    let visual_range = app.selection_range();
+
     let data_width = inner.width.saturating_sub(header_width);
     let visible_bytes = (data_width as usize) / 3;
 
@@ -144,9 +147,14 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
                     let is_cursor_byte = app.cursor_offset == byte_offset;
                     let is_search_match = app.search_state.is_match_byte(byte_offset);
                     let is_current_match = app.search_state.is_current_match_byte(byte_offset);
+                    let is_visual_selected = visual_range
+                        .map(|(s, e)| byte_offset >= s && byte_offset <= e)
+                        .unwrap_or(false);
 
                     let (fg, bg) = if is_cursor_byte {
                         (Color::Black, Some(Color::White))
+                    } else if is_visual_selected {
+                        (Color::Black, Some(Color::Indexed(39)))
                     } else if is_current_match {
                         (Color::White, Some(Color::Indexed(214)))
                     } else if is_search_match {
@@ -183,4 +191,50 @@ fn center_rect(rect: Rect, width: u16, height: u16) -> Rect {
     let x = rect.x + (rect.width.saturating_sub(width)) / 2;
     let y = rect.y + (rect.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(rect.width), height.min(rect.height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::buffer::Buffer;
+    use crate::frame::{FrameConfig, ViewMode, build_frame_index};
+
+    /// 回归测试（Task #22）：frame 视图下 Visual 选中字节应以选区背景色高亮（与 hex_view 一致）
+    #[test]
+    fn frame_view_renders_visual_selection_highlight() {
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&[0xABu8; 64]);
+        let index = build_frame_index(
+            app.buffer.data(),
+            &FrameConfig::FixedLength { length: 32 },
+        );
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+        // 选中字节 2..=5（光标在 5）
+        app.visual_anchor = Some(2);
+        app.cursor_offset = 5;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 12);
+        terminal
+            .draw(|f| render_frame_view(f, area, &app))
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        // 布局：边框 1 列 + 行头宽 22（20 + 长度位数 2）；
+        // 首帧数据行位于 y=3（边框 1 + 刻度线 + 数字行）；字节 i 起始列 = 1+22+i*3
+        let row_y = 3;
+        let cell_bg = |byte_i: u16| buf[(1 + 22 + byte_i * 3, row_y)].bg;
+
+        // 光标行背景为 Indexed(236)，未选中字节继承该行背景；选中字节为 Indexed(39)
+        assert_eq!(cell_bg(0), Color::Indexed(236), "未选中字节不应有选区背景");
+        assert_eq!(cell_bg(2), Color::Indexed(39), "选中字节应有选区背景色");
+        assert_eq!(cell_bg(4), Color::Indexed(39), "选中字节应有选区背景色");
+        assert_eq!(cell_bg(5), Color::White, "光标字节保持光标样式（白底）");
+        assert_eq!(cell_bg(6), Color::Indexed(236), "选区外字节不应有选区背景");
+    }
 }
