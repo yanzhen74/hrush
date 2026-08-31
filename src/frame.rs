@@ -6,7 +6,7 @@ pub enum FrameConfig {
 }
 
 /// 单帧信息
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub offset: usize,
     pub length: usize,
@@ -173,17 +173,10 @@ fn build_sync_word_frames(data: &[u8], pattern: &[u8]) -> Vec<Frame> {
         }];
     }
 
-    let mut matches = Vec::new();
-    let pat_len = pattern.len();
-    let data_len = data.len();
-
-    if pat_len <= data_len {
-        for i in 0..=data_len - pat_len {
-            if &data[i..i + pat_len] == pattern {
-                matches.push(i);
-            }
-        }
-    }
+    // 同步字为无通配精确字节串，复用 SIMD 加速扫描（memmem Two-Way），
+    // 语义与旧朴素扫描一致（含重叠匹配）
+    let pat: Vec<Option<u8>> = pattern.iter().map(|&b| Some(b)).collect();
+    let matches = crate::search::find_all_matches(data, &pat, None, None);
 
     if matches.is_empty() {
         return vec![Frame {
@@ -206,10 +199,99 @@ fn build_sync_word_frames(data: &[u8], pattern: &[u8]) -> Vec<Frame> {
         let length = if i + 1 < matches.len() {
             matches[i + 1] - matches[i]
         } else {
-            data_len - matches[i]
+            data.len() - matches[i]
         };
         frames.push(Frame { offset, length });
     }
 
     frames
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn sync_word_frames_basic() {
+        // 同步字起始的两帧，无前置数据：不产生前导帧
+        let data = [0xAA, 0xBB, 0x01, 0x02, 0xAA, 0xBB, 0x03];
+        let idx = build_frame_index(
+            &data,
+            &FrameConfig::SyncWord {
+                pattern: vec![0xAA, 0xBB],
+            },
+        );
+        assert_eq!(idx.frames.len(), 2);
+        assert_eq!(idx.frames[0].offset, 0);
+        assert_eq!(idx.frames[0].length, 4);
+        assert_eq!(idx.frames[1].offset, 4);
+        assert_eq!(idx.frames[1].length, 3);
+    }
+
+    #[test]
+    fn sync_word_frames_preamble_and_no_match() {
+        // 同步字前的字节归入前导帧
+        let data = [0x00, 0x11, 0xAA, 0xBB, 0x01];
+        let idx = build_frame_index(
+            &data,
+            &FrameConfig::SyncWord {
+                pattern: vec![0xAA, 0xBB],
+            },
+        );
+        assert_eq!(idx.frames.len(), 2);
+        assert_eq!(idx.frames[0], Frame { offset: 0, length: 2 });
+        assert_eq!(idx.frames[1], Frame { offset: 2, length: 3 });
+
+        // 无匹配：整个文件为单帧（与旧行为一致）
+        let idx = build_frame_index(
+            &[0x00, 0x11, 0x22],
+            &FrameConfig::SyncWord {
+                pattern: vec![0xAA, 0xBB],
+            },
+        );
+        assert_eq!(idx.frames, vec![Frame { offset: 0, length: 3 }]);
+    }
+
+    #[test]
+    fn sync_word_frames_large_simd_beats_naive() {
+        // 16MB 稀疏同步字：结果必须与朴素扫描一致且更快（防回归）
+        let n = 16 * 1024 * 1024usize;
+        let mut data = vec![0x11u8; n];
+        for pos in [1000usize, 5_000_000, n - 2] {
+            data[pos] = 0xAA;
+            data[pos + 1] = 0xBB;
+        }
+        let pattern = vec![0xAA, 0xBB];
+
+        // 朴素扫描（优化前实现）
+        let start = Instant::now();
+        let mut naive = Vec::new();
+        for i in 0..=n - 2 {
+            if &data[i..i + 2] == &pattern[..] {
+                naive.push(i);
+            }
+        }
+        let naive_elapsed = start.elapsed();
+
+        // SIMD 扫描（新实现）
+        let start = Instant::now();
+        let idx = build_frame_index(
+            &data,
+            &FrameConfig::SyncWord {
+                pattern: pattern.clone(),
+            },
+        );
+        let simd_elapsed = start.elapsed();
+
+        // 首匹配不在 0 → 额外一个前导帧，故帧数 = 匹配数 + 1
+        assert_eq!(idx.frames.len(), naive.len() + 1, "帧数应等于匹配数+前导帧");
+        assert_eq!(idx.frames[1].offset, naive[0], "首同步字帧偏移应对齐匹配位置");
+        assert!(
+            simd_elapsed < naive_elapsed,
+            "SIMD 扫描 {:?} 应快于朴素扫描 {:?}",
+            simd_elapsed,
+            naive_elapsed
+        );
+    }
 }
