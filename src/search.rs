@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use memchr::{memchr, memmem};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 
@@ -22,6 +23,7 @@ impl SearchPattern {
     }
 
     /// 无通配时返回原始字节（可直接用于精确比较）
+    #[allow(dead_code)] // 保留供外部快路径判断使用（如增量搜索场景）
     pub fn exact_bytes(&self) -> Option<Vec<u8>> {
         self.pattern().into_iter().collect()
     }
@@ -87,8 +89,7 @@ impl SearchState {
 
         self.pattern = Some(pattern.clone());
 
-        // 无通配时走原有精确匹配的快路径，行为与性能完全不变
-        let exact_bytes = pattern.exact_bytes();
+        // 进度总量：所有可能的匹配起始位置数（由 find_all_matches 内部维护实际扫描进度）
         let total = if data.len() >= pat_len {
             data.len() - pat_len + 1
         } else {
@@ -111,49 +112,7 @@ impl SearchState {
         let pat = pattern.pattern();
 
         let handle = thread::spawn(move || {
-            let mut matches = Vec::new();
-            let data_len = data.len();
-
-            for i in 0..=(data_len - pat_len) {
-                // 检查取消标志
-                if cancel_flag.load(Ordering::SeqCst) {
-                    let mut p = progress.lock().unwrap();
-                    p.cancelled = true;
-                    p.done = true;
-                    return matches;
-                }
-
-                // 线性匹配
-                match &exact_bytes {
-                    Some(pat_bytes) => {
-                        if data[i..].starts_with(pat_bytes) {
-                            matches.push(i);
-                        }
-                    }
-                    None => {
-                        if matches_at(&data, i, &pat) {
-                            matches.push(i);
-                        }
-                    }
-                }
-
-                // 每 4096 字节更新一次进度
-                if i % 4096 == 0 {
-                    let mut p = progress.lock().unwrap();
-                    p.scanned = i + 1;
-                    p.matches_found = matches.len();
-                }
-            }
-
-            // 最终更新进度
-            {
-                let mut p = progress.lock().unwrap();
-                p.scanned = total;
-                p.matches_found = matches.len();
-                p.done = true;
-            }
-
-            matches
+            find_all_matches(&data, &pat, Some(&cancel_flag), Some(&progress))
         });
 
         self.search_handle = Some(handle);
@@ -348,12 +307,7 @@ pub fn replace_all(app: &mut App, old: &SearchPattern, new_bytes: &[u8]) -> Resu
     let pat = old.pattern();
 
     if old_len <= buf_len {
-        for i in 0..=buf_len - old_len {
-            let window = app.buffer.get_range(i, old_len);
-            if matches_at(&window, 0, &pat) {
-                matches.push(i);
-            }
-        }
+        matches = find_all_matches(app.buffer.data(), &pat, None, None);
     }
 
     if matches.is_empty() {
@@ -390,6 +344,149 @@ pub fn replace_all(app: &mut App, old: &SearchPattern, new_bytes: &[u8]) -> Resu
     app.search_state.clear();
 
     Ok(())
+}
+
+/// 核心扫描：返回所有匹配起始偏移（保留重叠匹配语义）
+///
+/// - 精确模式（无通配）：使用 `memmem::Finder`（Two-Way 算法 + SIMD）
+/// - 通配模式：以第一个固定字节为锚点，用 `memchr`（SIMD）跳到候选位置后验证整个模式
+/// - 全通配模式：所有位置均匹配，直接批量生成（仍支持取消与进度上报）
+pub fn find_all_matches(
+    data: &[u8],
+    pat: &[Option<u8>],
+    cancel_flag: Option<&AtomicBool>,
+    progress: Option<&Mutex<SearchProgress>>,
+) -> Vec<usize> {
+    let mut matches = Vec::new();
+    let pat_len = pat.len();
+    if pat_len == 0 || data.len() < pat_len {
+        if let Some(p) = progress {
+            let mut p = p.lock().unwrap();
+            p.matches_found = 0;
+            p.done = true;
+        }
+        return matches;
+    }
+    let max_start = data.len() - pat_len;
+    let total = max_start + 1;
+
+    let fixed: Vec<(usize, u8)> = pat
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.map(|b| (i, b)))
+        .collect();
+
+    // 全通配：每个位置都匹配，批量生成并保留取消/进度支持
+    if fixed.is_empty() {
+        let mut pos = 0usize;
+        while pos <= max_start {
+            if cancel_flag.map_or(false, |f| f.load(Ordering::SeqCst)) {
+                if let Some(p) = progress {
+                    let mut p = p.lock().unwrap();
+                    p.cancelled = true;
+                    p.done = true;
+                }
+                return matches;
+            }
+            let batch_end = (pos + 65536).min(max_start + 1);
+            matches.extend(pos..batch_end);
+            pos = batch_end;
+            if let Some(p) = progress {
+                let mut p = p.lock().unwrap();
+                p.scanned = pos;
+                p.matches_found = matches.len();
+            }
+        }
+        if let Some(p) = progress {
+            let mut p = p.lock().unwrap();
+            p.scanned = total;
+            p.matches_found = matches.len();
+            p.done = true;
+        }
+        return matches;
+    }
+
+    // 按模式特征选择 SIMD 扫描策略
+    enum ScanMode<'a> {
+        /// 精确字节串：Two-Way + SIMD 子串搜索（needle 生命周期绑定模式字节）
+        Exact(memmem::Finder<'a>),
+        /// 通配模式：锚定字节索引与值（用 memchr 跳跃后验证全模式）
+        Anchored(usize, u8),
+    }
+    let needle: Vec<u8> = pat.iter().filter_map(|b| *b).collect();
+    let anchor = fixed[0];
+    let mode = if fixed.len() == pat_len {
+        ScanMode::Exact(memmem::Finder::new(&needle))
+    } else {
+        ScanMode::Anchored(anchor.0, anchor.1)
+    };
+
+    let mut pos = 0usize;
+    let mut last_reported = 0usize;
+
+    loop {
+        if pos > max_start {
+            break;
+        }
+        if cancel_flag.map_or(false, |f| f.load(Ordering::SeqCst)) {
+            if let Some(p) = progress {
+                let mut p = p.lock().unwrap();
+                p.cancelled = true;
+                p.done = true;
+            }
+            return matches;
+        }
+
+        match &mode {
+            ScanMode::Exact(finder) => {
+                // 精确字节串：SIMD 加速子串搜索
+                match finder.find(&data[pos..]) {
+                    Some(rel) => {
+                        matches.push(pos + rel);
+                        // 从匹配位置 +1 继续，保留重叠匹配语义
+                        pos = pos + rel + 1;
+                    }
+                    None => break,
+                }
+            }
+            ScanMode::Anchored(anchor_idx, anchor_byte) => {
+                // 通配模式：锚定字节跳跃 + 全模式验证
+                let (anchor_idx, anchor_byte) = (*anchor_idx, *anchor_byte);
+                let search_from = pos + anchor_idx;
+                match memchr(anchor_byte, &data[search_from..]) {
+                    Some(rel) => {
+                        let candidate = search_from + rel - anchor_idx;
+                        if candidate > max_start {
+                            break;
+                        }
+                        if matches_at(data, candidate, pat) {
+                            matches.push(candidate);
+                        }
+                        pos = candidate + 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // 每扫描约 4096 字节更新一次进度
+        if let Some(p) = progress {
+            if pos >= last_reported + 4096 {
+                let mut p = p.lock().unwrap();
+                p.scanned = pos;
+                p.matches_found = matches.len();
+                last_reported = pos;
+            }
+        }
+    }
+
+    if let Some(p) = progress {
+        let mut p = p.lock().unwrap();
+        p.scanned = total;
+        p.matches_found = matches.len();
+        p.done = true;
+    }
+    matches
 }
 
 /// 判断 data 在 offset 处是否匹配模式（None 为通配字节）
@@ -523,5 +620,85 @@ mod tests {
             SearchPattern::Hex(b) => assert_eq!(b, vec![Some(0xAA), None, Some(0xBB)]),
             _ => panic!("expected Hex pattern"),
         }
+    }
+
+    #[test]
+    fn overlapping_matches_preserved() {
+        // 精确模式：重叠匹配不能丢失（SIMD 快路径）
+        // AA AA AA AA 中搜 x:AAAA：候选位置 0/1/2 均匹配（与旧朴素扫描语义一致）
+        let pat = parse_pattern("x:AAAA").unwrap();
+        assert_eq!(run_search(vec![0xAA; 4], pat), vec![0, 1, 2]);
+        // ASCII 模式同理："aaa" 中搜 "aa" → [0, 1]
+        let pat = parse_pattern("aa").unwrap();
+        assert_eq!(run_search(b"aaa".to_vec(), pat), vec![0, 1]);
+    }
+
+    #[test]
+    fn wildcard_anchor_finds_sparse_matches() {
+        // 通配模式：锚定字节跳跃后仍能正确验证全模式（含重叠语义）
+        let mut data = vec![0u8; 100_000];
+        data[1000] = 0xDE;
+        data[1001] = 0xAD;
+        data[99_998] = 0xDE;
+        data[99_999] = 0xAD;
+        let pat = parse_pattern("x:??DEAD").unwrap();
+        assert_eq!(run_search(data, pat), vec![999, 99_997]);
+    }
+
+    #[test]
+    fn large_file_exact_search_is_fast() {
+        // 64MB 数据、模式仅出现一次：SIMD 扫描应在秒内完成（旧朴素扫描在 debug 下通常远超 2 秒）
+        let n = 64 * 1024 * 1024usize;
+        let mut data = vec![0xABu8; n];
+        let pos = n / 2;
+        data[pos..pos + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let pat = parse_pattern("x:DEADBEEF").unwrap();
+
+        let start = std::time::Instant::now();
+        let matches = run_search(data, pat);
+        let elapsed = start.elapsed();
+
+        assert_eq!(matches, vec![pos]);
+        assert!(
+            elapsed.as_secs() < 2,
+            "64MB 精确搜索耗时 {:?}，SIMD 快路径应远快于此",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn simd_search_beats_naive_scan() {
+        // 同一数据上对比旧朴素扫描与新 SIMD 扫描，结果必须一致且更快
+        let n = 16 * 1024 * 1024usize;
+        let mut data = vec![0x00u8; n];
+        data[n - 4..].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        data[123] = 0xDE;
+        data[124] = 0xAD;
+        data[125] = 0xBE;
+        data[126] = 0xEF;
+        let pat = parse_pattern("x:DEADBEEF").unwrap().pattern();
+
+        // 朴素扫描（优化前实现）
+        let start = std::time::Instant::now();
+        let mut naive_matches = Vec::new();
+        for i in 0..=n - pat.len() {
+            if matches_at(&data, i, &pat) {
+                naive_matches.push(i);
+            }
+        }
+        let naive_elapsed = start.elapsed();
+
+        // SIMD 扫描（新实现）
+        let start = std::time::Instant::now();
+        let simd_matches = find_all_matches(&data, &pat, None, None);
+        let simd_elapsed = start.elapsed();
+
+        assert_eq!(simd_matches, naive_matches, "两种扫描结果必须一致");
+        assert!(
+            simd_elapsed < naive_elapsed,
+            "SIMD 扫描 {:?} 应快于朴素扫描 {:?}",
+            simd_elapsed,
+            naive_elapsed
+        );
     }
 }
