@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::app::{App, LastChange, Mode};
+use crate::app::{App, BlockInsertCtx, LastChange, Mode, VisualKind, YankBuffer};
 use crate::command;
 use crate::editor;
 use crate::frame::ViewMode;
@@ -321,31 +321,60 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             repeat_last_change(app, count);
         }
 
-        // Visual 模式（V 进入行选模式）
+        // Visual Block 模式（Ctrl+V，必须在无修饰符 v 之前匹配）
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.mode = Mode::Visual;
+            app.visual_anchor = Some(app.cursor_offset);
+            app.visual_kind = Some(VisualKind::Block);
+            let col = if app.is_frame_mode() {
+                app.current_frame().map_or(0, |f| app.cursor_offset - f.offset)
+            } else {
+                app.cursor_offset % 16
+            };
+            app.block_col_anchor = Some(col);
+        }
+        // Visual 模式（v 进入字符选区）
         KeyCode::Char('v') => {
             app.mode = Mode::Visual;
             app.visual_anchor = Some(app.cursor_offset);
-            app.visual_line = false;
+            app.visual_kind = Some(VisualKind::Char);
+            app.block_col_anchor = None;
         }
         KeyCode::Char('V') => {
             app.mode = Mode::Visual;
             app.visual_anchor = Some(app.cursor_offset);
-            app.visual_line = true;
+            app.visual_kind = Some(VisualKind::Line);
+            app.block_col_anchor = None;
+        }
+
+        // 覆盖粘贴（Ctrl+P，必须在无修饰符 p 之前匹配；:overpaste 共享同一入口）
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            do_overwrite_paste(app);
         }
 
         // 粘贴
         KeyCode::Char('p') => {
-            if !app.yank_buffer.is_empty() {
-                let insert_pos = if app.buffer.is_empty() {
-                    0
-                } else {
-                    app.cursor_offset + 1
-                };
-                let yank_data = app.yank_buffer.clone();
-                let len = yank_data.len();
-                editor::insert_bytes(app, insert_pos, &yank_data);
-                app.cursor_offset = (insert_pos + len - 1).min(app.buffer.len().saturating_sub(1));
-                app.last_change = Some(LastChange::Paste);
+            let yank = app.yank_buffer.clone();
+            match yank {
+                YankBuffer::Flat(data) => {
+                    if !data.is_empty() {
+                        let insert_pos = if app.buffer.is_empty() {
+                            0
+                        } else {
+                            app.cursor_offset + 1
+                        };
+                        let len = data.len();
+                        editor::insert_bytes(app, insert_pos, &data);
+                        app.cursor_offset = (insert_pos + len - 1).min(app.buffer.len().saturating_sub(1));
+                        app.last_change = Some(LastChange::Paste);
+                    }
+                }
+                YankBuffer::Block(rows) => {
+                    if !rows.is_empty() {
+                        do_block_paste(app, &rows);
+                        app.last_change = Some(LastChange::Paste);
+                    }
+                }
             }
         }
 
@@ -460,11 +489,26 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.mode = Mode::Normal;
             app.visual_anchor = None;
-            app.visual_line = false;
+            app.visual_kind = None;
+            app.block_col_anchor = None;
         }
-        // v / V 在字符选区与行选区之间切换（锚点不变）
-        KeyCode::Char('v') | KeyCode::Char('V') => {
-            app.visual_line = !app.visual_line;
+        // v / V / Ctrl+V 在字符选区、行选区、块选区之间切换（锚点不变）
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.visual_kind = Some(VisualKind::Block);
+            let col = if app.is_frame_mode() {
+                app.current_frame().map_or(0, |f| app.cursor_offset - f.offset)
+            } else {
+                app.cursor_offset % 16
+            };
+            app.block_col_anchor = Some(col);
+        }
+        KeyCode::Char('v') => {
+            app.visual_kind = Some(VisualKind::Char);
+            app.block_col_anchor = None;
+        }
+        KeyCode::Char('V') => {
+            app.visual_kind = Some(VisualKind::Line);
+            app.block_col_anchor = None;
         }
         KeyCode::Char('h') | KeyCode::Left => move_cursor_left(app, count),
         KeyCode::Char('l') | KeyCode::Right => move_cursor_right(app, count),
@@ -480,41 +524,161 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('G') => {
             if !app.buffer.is_empty() {
-                app.cursor_offset = app.buffer.len().saturating_sub(1);
+                if app.visual_kind == Some(VisualKind::Block) {
+                    // 块选模式：跳末行时保持当前列，避免块宽被末行列号拉宽
+                    if app.is_frame_mode() {
+                        if let Some(fi) = &app.frame_index {
+                            if !fi.frames.is_empty() {
+                                let cur_frame = app.current_frame_number().unwrap_or(0);
+                                let col = app.cursor_offset.saturating_sub(fi.frames[cur_frame].offset);
+                                let last = &fi.frames[fi.frames.len() - 1];
+                                app.cursor_offset = last.offset + col.min(last.length.saturating_sub(1));
+                            }
+                        }
+                    } else {
+                        let col = app.cursor_offset % 16;
+                        app.cursor_offset = (app.buffer.len().saturating_sub(1)).min(
+                            (app.buffer.len().saturating_sub(1)) / 16 * 16 + col,
+                        );
+                    }
+                } else {
+                    app.cursor_offset = app.buffer.len().saturating_sub(1);
+                }
             }
         }
         // 进入 Command 模式：选区范围暂存到 pending_range（校验和命令优先使用），
+        // Block 模式额外暂存 pending_segments（:fill/:set/校验和逐段操作）；
         // 同时退出 Visual（visual_anchor 清空，选区高亮消失）
         KeyCode::Char(':') => {
             app.pending_range = app.selection_range();
+            if app.visual_kind == Some(VisualKind::Block) {
+                app.pending_segments = Some(app.selection_segments());
+            } else {
+                app.pending_segments = None;
+            }
             app.visual_anchor = None;
-            app.visual_line = false;
+            app.visual_kind = None;
+            app.block_col_anchor = None;
             app.mode = Mode::Command;
             app.command_input.clear();
             app.history_index = None;
         }
         KeyCode::Char('y') => {
-            if let Some((start, end)) = app.selection_range() {
+            if app.visual_kind == Some(VisualKind::Block) {
+                let segs = app.selection_segments();
+                let block: Vec<Vec<u8>> = segs.iter()
+                    .map(|&(s, e)| app.buffer.get_range(s, e - s + 1).to_vec())
+                    .collect();
+                app.yank_buffer = YankBuffer::Block(block);
+                if let Some(&(s, _)) = segs.first() {
+                    app.cursor_offset = s;
+                }
+            } else if let Some((start, end)) = app.selection_range() {
                 let len = end - start + 1;
-                app.yank_buffer = app.buffer.get_range(start, len).to_vec();
-                app.mode = Mode::Normal;
-                app.visual_anchor = None;
-                app.visual_line = false;
+                app.yank_buffer = YankBuffer::Flat(app.buffer.get_range(start, len).to_vec());
                 app.cursor_offset = start;
             }
+            app.mode = Mode::Normal;
+            app.visual_anchor = None;
+            app.visual_kind = None;
+            app.block_col_anchor = None;
         }
         KeyCode::Char('d') | KeyCode::Char('x') => {
-            if let Some((start, end)) = app.selection_range() {
+            if app.visual_kind == Some(VisualKind::Block) {
+                let segs = app.selection_segments();
+                // 先 yank
+                let block: Vec<Vec<u8>> = segs.iter()
+                    .map(|&(s, e)| app.buffer.get_range(s, e - s + 1).to_vec())
+                    .collect();
+                app.yank_buffer = YankBuffer::Block(block);
+                // 反向逐段删除（高偏移先删，避免偏移漂移），缓冲区一次完成避免 O(n²)
+                let total_len: usize = segs.iter().map(|&(s, e)| e - s + 1).sum();
+                let ranges: Vec<(usize, usize)> = segs.iter().rev()
+                    .map(|&(s, e)| (s, e - s + 1))
+                    .collect();
+                app.undo_manager.begin_group("block delete");
+                editor::remove_ranges_batch(app, &ranges);
+                app.undo_manager.end_group();
+                if let Some(&(s, _)) = segs.first() {
+                    app.cursor_offset = s;
+                }
+                clamp_cursor(app);
+                app.last_change = Some(LastChange::Delete { len: total_len });
+            } else if let Some((start, end)) = app.selection_range() {
                 let len = end - start + 1;
-                app.yank_buffer = app.buffer.get_range(start, len).to_vec();
+                app.yank_buffer = YankBuffer::Flat(app.buffer.get_range(start, len).to_vec());
                 editor::remove_range(app, start, len);
-                app.mode = Mode::Normal;
-                app.visual_anchor = None;
-                app.visual_line = false;
                 app.cursor_offset = start;
                 clamp_cursor(app);
                 app.last_change = Some(LastChange::Delete { len });
             }
+            app.mode = Mode::Normal;
+            app.visual_anchor = None;
+            app.visual_kind = None;
+            app.block_col_anchor = None;
+        }
+        KeyCode::Char('i') => {
+            if app.visual_kind == Some(VisualKind::Block) {
+                let segs = app.selection_segments();
+                if let Some(&(s, _)) = segs.first() {
+                    app.block_insert_ctx = Some(BlockInsertCtx {
+                        segments: segs,
+                        insert_left: true,
+                    });
+                    app.mode = Mode::Insert;
+                    app.insert_after = false;
+                    app.nibble_input = None;
+                    app.cursor_offset = s;
+                    app.change_start = Some(s);
+                    // 会话组在此打开：键入字节与 Esc 批量段同组，一次 u 整体撤销
+                    app.undo_manager.begin_group("block insert");
+                    app.visual_anchor = None;
+                    app.visual_kind = None;
+                    app.block_col_anchor = None;
+                    return;
+                }
+            }
+            // 非 Block 模式：回退到普通插入
+            app.mode = Mode::Insert;
+            app.insert_after = false;
+            app.nibble_input = None;
+            app.change_start = Some(app.cursor_offset);
+            app.visual_anchor = None;
+            app.visual_kind = None;
+            app.block_col_anchor = None;
+        }
+        KeyCode::Char('a') => {
+            if app.visual_kind == Some(VisualKind::Block) {
+                let segs = app.selection_segments();
+                if let Some(&(_, e)) = segs.first() {
+                    app.block_insert_ctx = Some(BlockInsertCtx {
+                        segments: segs,
+                        insert_left: false,
+                    });
+                    app.mode = Mode::Insert;
+                    app.insert_after = true;
+                    app.nibble_input = None;
+                    app.cursor_offset = (e + 1).min(app.buffer.len());
+                    app.change_start = Some(app.cursor_offset);
+                    // 会话组在此打开：键入字节与 Esc 批量段同组，一次 u 整体撤销
+                    app.undo_manager.begin_group("block insert");
+                    app.visual_anchor = None;
+                    app.visual_kind = None;
+                    app.block_col_anchor = None;
+                    return;
+                }
+            }
+            // 非 Block 模式：回退到普通插入
+            app.mode = Mode::Insert;
+            app.insert_after = true;
+            app.nibble_input = None;
+            if !app.buffer.is_empty() {
+                app.cursor_offset = (app.cursor_offset + 1).min(app.buffer.len());
+            }
+            app.change_start = Some(app.cursor_offset);
+            app.visual_anchor = None;
+            app.visual_kind = None;
+            app.block_col_anchor = None;
         }
         _ => {}
     }
@@ -526,12 +690,46 @@ fn handle_insert_mode(app: &mut App, key: KeyEvent) {
             app.mode = Mode::Normal;
             app.insert_after = false;
             app.nibble_input = None;
-            // 截取本次会话插入的字节（空会话不记录，保留上次修改）
-            if let Some(start) = app.change_start.take() {
-                let end = app.cursor_offset.min(app.buffer.len());
-                if end > start {
-                    let bytes = app.buffer.get_range(start, end - start).to_vec();
-                    app.last_change = Some(LastChange::Insert { bytes });
+
+            // 块插入会话退出：截取插入字节并应用到所有块段
+            let block_ctx = app.block_insert_ctx.take();
+            if let Some(ctx) = block_ctx {
+                if let Some(start) = app.change_start.take() {
+                    let end = app.cursor_offset.min(app.buffer.len());
+                    if end > start {
+                        let bytes = app.buffer.get_range(start, end - start).to_vec();
+                        // 从最后一行段向上计算各插入点（高偏移优先，避免偏移漂移），
+                        // extra 复现逐段插入时钳制到增长后缓冲末尾的坐标，
+                        // 再一次性批量插入，避免逐段 O(n²) 假死。
+                        // 选区段坐标为键入前抓取，键入字节已把其后内容右移 bytes.len()，
+                        // 其余段需 +shift 换算到当前坐标，否则插到目标列左侧
+                        let buf_len = app.buffer.len();
+                        let shift = bytes.len();
+                        let mut inserts: Vec<(usize, Vec<u8>)> = Vec::new();
+                        let mut extra = 0usize;
+                        for &(seg_start, seg_end) in ctx.segments.iter().skip(1).rev() {
+                            let insert_pos = if ctx.insert_left {
+                                seg_start + shift
+                            } else {
+                                (seg_end + 1 + shift).min(buf_len + extra)
+                            };
+                            extra += bytes.len();
+                            inserts.push((insert_pos, bytes.clone()));
+                        }
+                        editor::insert_bytes_batch(app, &inserts);
+                        app.last_change = Some(LastChange::Insert { bytes });
+                    }
+                }
+                // 关闭 i/a 键入时打开的会话组：键入字节 + 批量段 = 单一撤销单元
+                app.undo_manager.end_group();
+            } else {
+                // 普通插入会话退出
+                if let Some(start) = app.change_start.take() {
+                    let end = app.cursor_offset.min(app.buffer.len());
+                    if end > start {
+                        let bytes = app.buffer.get_range(start, end - start).to_vec();
+                        app.last_change = Some(LastChange::Insert { bytes });
+                    }
                 }
             }
             clamp_cursor(app);
@@ -874,6 +1072,128 @@ fn clamp_cursor(app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
+// 块粘贴辅助函数
+// ---------------------------------------------------------------------------
+
+/// 返回行基址（标准视图 row*16，帧模式 frame.offset）
+fn row_base_offset(app: &App, row: usize) -> Option<usize> {
+    if app.is_frame_mode() {
+        app.frame_index.as_ref()
+            .and_then(|fi| fi.frames.get(row))
+            .map(|f| f.offset)
+    } else {
+        Some(row * 16)
+    }
+}
+
+/// 返回行长度（标准视图 16，帧模式 frame.length）
+fn row_length(app: &App, row: usize) -> usize {
+    if app.is_frame_mode() {
+        app.frame_index.as_ref()
+            .and_then(|fi| fi.frames.get(row))
+            .map_or(0, |f| f.length)
+    } else {
+        16
+    }
+}
+
+/// 获取光标所在行列 (row, col)
+fn cursor_row_col(app: &App) -> (usize, usize) {
+    if app.is_frame_mode() {
+        if let Some(fi) = &app.frame_index {
+            if let Some(frame_num) = app.current_frame_number() {
+                let col = app.cursor_offset.saturating_sub(fi.frames[frame_num].offset);
+                return (frame_num, col);
+            }
+        }
+        (0, 0)
+    } else {
+        (app.cursor_offset / 16, app.cursor_offset % 16)
+    }
+}
+
+/// 块插入粘贴 (p)：自底向上计算各行插入点（下方插入不影响上方偏移），
+/// 再一次性批量插入，避免逐行插入的 O(n²) 开销导致界面假死
+fn do_block_paste(app: &mut App, rows: &[Vec<u8>]) {
+    let (cursor_row, cursor_col) = cursor_row_col(app);
+    let buf_len = app.buffer.len();
+    let mut inserts: Vec<(usize, Vec<u8>)> = Vec::new();
+    // extra = 已安排在下方各行的字节数，复现逐行插入时钳制到增长后缓冲末尾的坐标，
+    // 保证记录的撤销偏移与原逐行实现完全一致（越界行追加到末尾）
+    let mut extra = 0usize;
+    for (i, data) in rows.iter().enumerate().rev() {
+        let target_row = cursor_row + i;
+        if let Some(base) = row_base_offset(app, target_row) {
+            let row_len = row_length(app, target_row);
+            let insert_col = (cursor_col + 1).min(row_len);
+            let insert_pos = (base + insert_col).min(buf_len + extra);
+            extra += data.len();
+            inserts.push((insert_pos, data.clone()));
+        }
+    }
+    if inserts.is_empty() {
+        return;
+    }
+    app.undo_manager.begin_group("block paste");
+    editor::insert_bytes_batch(app, &inserts);
+    app.undo_manager.end_group();
+}
+
+/// 块覆盖粘贴 (Ctrl+P)：从最后一行向上覆盖，避免偏移漂移
+fn do_block_overwrite_paste(app: &mut App, rows: &[Vec<u8>]) {
+    let (cursor_row, cursor_col) = cursor_row_col(app);
+    app.undo_manager.begin_group("block overwrite paste");
+    for (i, data) in rows.iter().enumerate().rev() {
+        let target_row = cursor_row + i;
+        if let Some(base) = row_base_offset(app, target_row) {
+            let row_len = row_length(app, target_row);
+            for (j, &byte) in data.iter().enumerate() {
+                if cursor_col + j >= row_len {
+                    break;
+                }
+                let offset = base + cursor_col + j;
+                if offset < app.buffer.len() {
+                    editor::set_byte(app, offset, byte);
+                }
+            }
+        }
+    }
+    app.undo_manager.end_group();
+}
+
+/// 覆盖粘贴（Ctrl+P 与 :overpaste 共享入口；不增长文件，EOF 截断）
+pub fn do_overwrite_paste(app: &mut App) {
+    let yank_empty = match &app.yank_buffer {
+        YankBuffer::Flat(d) => d.is_empty(),
+        YankBuffer::Block(r) => r.is_empty(),
+    };
+    if yank_empty {
+        app.message = Some(("Nothing yanked".to_string(), std::time::Instant::now()));
+        return;
+    }
+    if app.buffer.is_empty() {
+        return;
+    }
+    let yank = app.yank_buffer.clone();
+    match yank {
+        YankBuffer::Flat(data) => {
+            app.undo_manager.begin_group("overwrite paste");
+            for (i, &byte) in data.iter().enumerate() {
+                let offset = app.cursor_offset + i;
+                if offset >= app.buffer.len() { break; }
+                editor::set_byte(app, offset, byte);
+            }
+            app.undo_manager.end_group();
+            app.last_change = Some(LastChange::OverwritePaste);
+        }
+        YankBuffer::Block(rows) => {
+            do_block_overwrite_paste(app, &rows);
+            app.last_change = Some(LastChange::OverwritePaste);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `.` 重复上次修改（支持数字前缀，重放不改变 last_change）
 // ---------------------------------------------------------------------------
 fn repeat_last_change(app: &mut App, count: usize) {
@@ -946,18 +1266,57 @@ fn repeat_last_change(app: &mut App, count: usize) {
             clamp_cursor(app);
         }
         LastChange::Paste => {
-            if app.yank_buffer.is_empty() {
-                return;
+            let yank = app.yank_buffer.clone();
+            match yank {
+                YankBuffer::Flat(data) => {
+                    if data.is_empty() {
+                        return;
+                    }
+                    let mut repeated = Vec::with_capacity(data.len() * count);
+                    for _ in 0..count {
+                        repeated.extend_from_slice(&data);
+                    }
+                    let insert_pos = if app.buffer.is_empty() { 0 } else { app.cursor_offset + 1 };
+                    editor::insert_bytes(app, insert_pos, &repeated);
+                    app.cursor_offset = (insert_pos + repeated.len() - 1)
+                        .min(app.buffer.len().saturating_sub(1));
+                }
+                YankBuffer::Block(rows) => {
+                    if rows.is_empty() {
+                        return;
+                    }
+                    for _ in 0..count {
+                        do_block_paste(app, &rows);
+                    }
+                }
             }
-            let yank_data = app.yank_buffer.clone();
-            let mut repeated = Vec::with_capacity(yank_data.len() * count);
-            for _ in 0..count {
-                repeated.extend_from_slice(&yank_data);
+        }
+        LastChange::OverwritePaste => {
+            let yank = app.yank_buffer.clone();
+            match yank {
+                YankBuffer::Flat(data) => {
+                    if data.is_empty() || app.buffer.is_empty() {
+                        return;
+                    }
+                    for _ in 0..count {
+                        app.undo_manager.begin_group("overwrite paste");
+                        for (i, &byte) in data.iter().enumerate() {
+                            let offset = app.cursor_offset + i;
+                            if offset >= app.buffer.len() { break; }
+                            editor::set_byte(app, offset, byte);
+                        }
+                        app.undo_manager.end_group();
+                    }
+                }
+                YankBuffer::Block(rows) => {
+                    if rows.is_empty() || app.buffer.is_empty() {
+                        return;
+                    }
+                    for _ in 0..count {
+                        do_block_overwrite_paste(app, &rows);
+                    }
+                }
             }
-            let insert_pos = if app.buffer.is_empty() { 0 } else { app.cursor_offset + 1 };
-            editor::insert_bytes(app, insert_pos, &repeated);
-            app.cursor_offset = (insert_pos + repeated.len() - 1)
-                .min(app.buffer.len().saturating_sub(1));
         }
     }
 }
@@ -1650,7 +2009,7 @@ mod tests {
     #[test]
     fn dot_repeats_paste() {
         let mut app = app_with_data(&[1, 2, 3]);
-        app.yank_buffer = vec![9];
+        app.yank_buffer = YankBuffer::Flat(vec![9]);
         app.cursor_offset = 0;
 
         let _ = handle_input(&mut app, key('p'));
@@ -1888,7 +2247,7 @@ mod tests {
 
         let _ = handle_input(&mut app, key('V'));
         assert_eq!(app.mode, Mode::Visual);
-        assert!(app.visual_line, "V 应进入行选模式");
+        assert_eq!(app.visual_kind, Some(VisualKind::Line), "V 应进入行选模式");
         assert_eq!(app.selection_range(), Some((0, 15)), "单行选区应吸附整行");
 
         let _ = handle_input(&mut app, key('j'));
@@ -1917,13 +2276,13 @@ mod tests {
         app.cursor_offset = 5;
 
         let _ = handle_input(&mut app, key('V'));
-        assert!(app.visual_line);
+        assert_eq!(app.visual_kind, Some(VisualKind::Line));
         let _ = handle_input(&mut app, key('v'));
-        assert!(!app.visual_line, "v 应切换为字符选区");
+        assert_eq!(app.visual_kind, Some(VisualKind::Char), "v 应切换为字符选区");
         assert_eq!(app.selection_range(), Some((5, 5)), "切换后选区不再吸附行边界");
         let _ = handle_input(&mut app, key('l'));
         let _ = handle_input(&mut app, key('V'));
-        assert!(app.visual_line, "V 应切换回行选");
+        assert_eq!(app.visual_kind, Some(VisualKind::Line), "V 应切换回行选");
         assert_eq!(app.selection_range(), Some((0, 15)));
         assert_eq!(app.visual_anchor, Some(5), "切换时锚点不变");
     }
@@ -1938,11 +2297,11 @@ mod tests {
         let _ = handle_input(&mut app, key('j'));
         let _ = handle_input(&mut app, key('d'));
         assert_eq!(app.mode, Mode::Normal);
-        assert!(!app.visual_line, "退出 Visual 应清零 visual_line");
+        assert_eq!(app.visual_kind, None, "退出 Visual 应清零 visual_kind");
         assert_eq!(app.buffer.len(), 16, "应删除前两行（32 字节）");
         assert_eq!(app.cursor_offset, 0, "光标应移到删除位置起始处");
         assert_eq!(app.last_change, Some(LastChange::Delete { len: 32 }));
-        assert_eq!(app.yank_buffer.len(), 32);
+        assert_eq!(app.yank_buffer, YankBuffer::Flat(vec![1u8; 32]));
     }
 
     /// 行选 y 复制整行；Esc 退出后 visual_line 清零且锚点清空
@@ -1953,14 +2312,14 @@ mod tests {
 
         let _ = handle_input(&mut app, key('V'));
         let _ = handle_input(&mut app, key('y'));
-        assert_eq!(app.yank_buffer, vec![7u8; 16], "y 应复制整个第二行");
+        assert_eq!(app.yank_buffer, YankBuffer::Flat(vec![7u8; 16]), "y 应复制整个第二行");
         assert_eq!(app.cursor_offset, 16, "复制后光标回到选区起始行首");
-        assert!(!app.visual_line);
+        assert_eq!(app.visual_kind, None);
 
         let _ = handle_input(&mut app, key('V'));
-        assert!(app.visual_line);
+        assert_eq!(app.visual_kind, Some(VisualKind::Line));
         let _ = handle_input(&mut app, esc());
-        assert!(!app.visual_line, "Esc 退出后 visual_line 应清零");
+        assert_eq!(app.visual_kind, None, "Esc 退出后 visual_kind 应清零");
         assert_eq!(app.visual_anchor, None);
     }
 
@@ -1974,7 +2333,760 @@ mod tests {
         let _ = handle_input(&mut app, key(':'));
         assert_eq!(app.mode, Mode::Command);
         assert_eq!(app.pending_range, Some((16, 31)), "pending_range 应为吸附后的整行范围");
-        assert!(!app.visual_line, "退出 Visual 应清零 visual_line");
+        assert_eq!(app.visual_kind, None, "退出 Visual 应清零 visual_kind");
+    }
+
+    // -----------------------------------------------------------------------
+    // Block 选区回归测试（Task #26）
+    // -----------------------------------------------------------------------
+
+    fn ctrl_v() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)
+    }
+
+    fn ctrl_p() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+    }
+
+    /// 设置块选区状态（标准视图）：锚点 offset，光标 offset，列锚 col
+    fn setup_block_selection(app: &mut App, anchor: usize, cursor: usize, col_anchor: usize) {
+        app.mode = Mode::Visual;
+        app.visual_anchor = Some(anchor);
+        app.visual_kind = Some(VisualKind::Block);
+        app.block_col_anchor = Some(col_anchor);
+        app.cursor_offset = cursor;
+    }
+
+    /// 1. selection_segments() 标准视图：3 行×2 列 → 3 段各 2 字节
+    #[test]
+    fn selection_segments_standard_3rows_2cols() {
+        let mut app = app_with_data(&[0u8; 48]); // 3 行 × 16 字节
+        // 锚点 row0/col1, 光标 row2/col2
+        setup_block_selection(&mut app, 1, 34, 1); // anchor=1, cursor=34
+        let segs = app.selection_segments();
+        assert_eq!(segs.len(), 3, "应得 3 段");
+        assert_eq!(segs[0], (1, 2), "行 0 片段");
+        assert_eq!(segs[1], (17, 18), "行 1 片段");
+        assert_eq!(segs[2], (33, 34), "行 2 片段");
+    }
+
+    /// 2. selection_segments() 帧模式：不等长帧正确处理短帧
+    #[test]
+    fn selection_segments_frame_mode_with_unequal_frames() {
+        // 3 帧：帧 0=10 字节，帧 1=10 字节，帧 2=5 字节（共 25 字节）
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&[0u8; 25]);
+        let index = crate::frame::build_frame_index(
+            app.buffer.data(),
+            &crate::frame::FrameConfig::FixedLength { length: 10 },
+        );
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+
+        // 块选区跨越所有 3 帧：锚点帧 0/col1, 光标帧 2/col4
+        app.mode = Mode::Visual;
+        app.visual_anchor = Some(1); // 帧 0, col 1
+        app.visual_kind = Some(VisualKind::Block);
+        app.block_col_anchor = Some(1);
+        app.cursor_offset = 24; // 帧 2, col 4
+
+        let segs = app.selection_segments();
+        assert_eq!(segs.len(), 3, "应得 3 段（3 帧）");
+        assert_eq!(segs[0], (1, 4), "帧 0: col1..col4");
+        assert_eq!(segs[1], (11, 14), "帧 1: col1..col4");
+        // 帧 2 只有 5 字节（col0..col4），选区 col1..col4 在范围内
+        assert_eq!(segs[2], (21, 24), "帧 2: col1..col4（不超帧长）");
+        assert!(segs[2].1 < 25, "帧 2 末端不应超出缓冲区");
+    }
+
+    /// 3. Block `y` 得到 `YankBuffer::Block` 形状
+    #[test]
+    fn block_yank_produces_block_yank_buffer() {
+        let mut app = app_with_data(&[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                                      0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+                                      0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                                      0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f]);
+        // 块选区: 2 行 × 2 列, col 1..2
+        // anchor=row0/col1=offset1, cursor=row1/col2=offset18
+        setup_block_selection(&mut app, 1, 18, 1);
+
+        let _ = handle_input(&mut app, key('y'));
+        assert_eq!(app.mode, Mode::Normal, "y 后应回 Normal");
+        match &app.yank_buffer {
+            YankBuffer::Block(rows) => {
+                assert_eq!(rows.len(), 2, "应复制 2 行");
+                assert_eq!(rows[0], &[0x11, 0x12], "第 1 行片段");
+                assert_eq!(rows[1], &[0x21, 0x22], "第 2 行片段");
+            }
+            _ => panic!("Block y 应产生 YankBuffer::Block"),
+        }
+    }
+
+    /// 4. Block `d` 反向删除 + 文件缩小 + 单次 `u` 撤销恢复
+    #[test]
+    fn block_delete_shrinks_file_and_undo_restores() {
+        let mut original = vec![0u8; 32]; // 2 行 × 16 字节
+        // 填充可识别数据
+        for (i, b) in original.iter_mut().enumerate() { *b = i as u8; }
+        let mut app = app_with_data(&original);
+        // 块选区: 2 行 × 2 列, col 1..2
+        // anchor=row0/col1=offset1, cursor=row1/col2=offset18
+        setup_block_selection(&mut app, 1, 18, 1);
+
+        let _ = handle_input(&mut app, key('d'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.buffer.len(), 28, "应删 4 字节（2 行×2 列）");
+
+        editor::undo(&mut app);
+        assert_eq!(app.buffer.data(), &original[..], "一次 u 应完整撤销块删除");
+    }
+
+    /// 5. Block `i` 逐行插入会话（输入字节后 Esc → 每行左边缘插入）
+    #[test]
+    fn block_insert_session_inserts_at_left_edge() {
+        let mut app = app_with_data(&[0x00; 48]); // 3 行 × 16 字节
+        // 块选区: 3 行 × 1 列, col 1..1
+        // anchor=row0/col1=offset1, cursor=row2/col1=offset33
+        setup_block_selection(&mut app, 1, 33, 1);
+
+        let _ = handle_input(&mut app, key('i'));
+        assert_eq!(app.mode, Mode::Insert, "i 应进入 Insert 模式");
+        assert!(app.block_insert_ctx.is_some(), "应设置 block_insert_ctx");
+
+        // 输入 "ab" = 0xAB（1 字节）
+        let _ = handle_input(&mut app, key('a'));
+        let _ = handle_input(&mut app, key('b'));
+        let _ = handle_input(&mut app, esc());
+
+        assert_eq!(app.mode, Mode::Normal, "Esc 应回 Normal");
+        assert!(app.block_insert_ctx.is_none(), "Esc 后应清空 block_insert_ctx");
+        // 第 0 行用户直接插入 1 字节，第 1/2 行由 block ctx 各插入 1 字节
+        // 总共增长 3 字节
+        assert_eq!(app.buffer.len(), 51, "块插入后文件应增长 3 字节");
+        // 验证行 0 原始 col1 位置已插入 0xAB
+        assert_eq!(app.buffer.get_range(1, 1), &[0xAB], "行 0 插入位置");
+    }
+
+    /// 6. `p` 对 Block yank 逐行插入
+    #[test]
+    fn block_paste_inserts_per_row() {
+        let mut app = app_with_data(&[0x00; 32]); // 2 行 × 16 字节
+        app.yank_buffer = YankBuffer::Block(vec![
+            vec![0xAA, 0xBB],
+            vec![0xCC, 0xDD],
+        ]);
+        app.cursor_offset = 0; // row 0, col 0
+
+        let _ = handle_input(&mut app, key('p'));
+        // 块粘贴应在光标列之后逐行插入
+        // row 0: [0x00, 0xAA, 0xBB, 0x00, ...] (16+2=18 字节)
+        // row 1: [0x00, 0xCC, 0xDD, 0x00, ...] (16+2=18 字节) - 但偏移已调整
+        assert_eq!(app.buffer.len(), 36, "粘贴 2 行×2 字节后应增长 4 字节");
+        // 验证行 0 数据
+        assert_eq!(app.buffer.get_range(0, 4), &[0x00, 0xAA, 0xBB, 0x00]);
+    }
+
+    /// 7. `Ctrl+P` Flat 覆盖（文件大小不变）
+    #[test]
+    fn ctrl_p_flat_overwrite_no_file_growth() {
+        let mut app = app_with_data(&[0x00, 0x00, 0x00, 0x00, 0x00]);
+        app.yank_buffer = YankBuffer::Flat(vec![0xFF, 0xFE, 0xFD]);
+        app.cursor_offset = 1;
+
+        let _ = handle_input(&mut app, ctrl_p());
+        assert_eq!(app.buffer.len(), 5, "Ctrl+P 不应改变文件大小");
+        assert_eq!(app.buffer.data(), &[0x00, 0xFF, 0xFE, 0xFD, 0x00]);
+    }
+
+    /// 8. `Ctrl+P` Block 覆盖（逐行覆盖列段）
+    #[test]
+    fn ctrl_p_block_overwrite_per_row() {
+        let mut app = app_with_data(&[0x00; 32]); // 2 行 × 16 字节
+        app.yank_buffer = YankBuffer::Block(vec![
+            vec![0xAA, 0xBB],
+            vec![0xCC, 0xDD],
+        ]);
+        app.cursor_offset = 2; // row 0, col 2
+
+        let _ = handle_input(&mut app, ctrl_p());
+        assert_eq!(app.buffer.len(), 32, "Ctrl+P Block 不应改变文件大小");
+        // 行 0 col2..3 应被覆盖为 [0xAA, 0xBB]
+        assert_eq!(app.buffer.get_range(2, 2), &[0xAA, 0xBB]);
+        // 行 1 col2..3 应被覆盖为 [0xCC, 0xDD]
+        assert_eq!(app.buffer.get_range(18, 2), &[0xCC, 0xDD]);
+    }
+
+    /// 9. `Ctrl+V` / `v` / `V` 三模式切换
+    #[test]
+    fn ctrl_v_v_v_three_mode_switch() {
+        let mut app = app_with_data(&[0u8; 16]);
+        // Ctrl+V 进入 Block
+        let _ = handle_input(&mut app, ctrl_v());
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(app.visual_kind, Some(VisualKind::Block), "Ctrl+V 应进入块选");
+        assert!(app.block_col_anchor.is_some(), "块选应设置 col_anchor");
+
+        // v 切换为 Char
+        let _ = handle_input(&mut app, key('v'));
+        assert_eq!(app.visual_kind, Some(VisualKind::Char), "v 应切换为字符选");
+        assert_eq!(app.block_col_anchor, None, "切换后应清空 col_anchor");
+
+        // V 切换为 Line
+        let _ = handle_input(&mut app, key('V'));
+        assert_eq!(app.visual_kind, Some(VisualKind::Line), "V 应切换为行选");
+
+        // Ctrl+V 再次切换为 Block
+        let _ = handle_input(&mut app, ctrl_v());
+        assert_eq!(app.visual_kind, Some(VisualKind::Block), "Ctrl+V 应切换回块选");
+        assert!(app.block_col_anchor.is_some());
+    }
+
+    /// 10. `:fill` 对块选区逐段操作（通过 pending_segments）
+    #[test]
+    fn fill_block_selection_via_pending_segments() {
+        let mut app = app_with_data(&[0u8; 48]); // 3 行 × 16 字节
+        // 块选区: 2 行 × 2 列, col 1..2
+        setup_block_selection(&mut app, 1, 18, 1); // anchor=row0/col1, cursor=row1/col2
+
+        // 按 : 进入 Command，应设置 pending_segments
+        let _ = handle_input(&mut app, key(':'));
+        assert_eq!(app.mode, Mode::Command);
+        assert!(app.pending_segments.is_some(), "Block : 应设置 pending_segments");
+        assert_eq!(app.pending_segments.as_ref().unwrap().len(), 2);
+
+        // 执行 :fill 0xFF
+        app.command_input = "fill 0xFF".to_string();
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.pending_segments, None, "命令执行后应清空 pending_segments");
+
+        // 验证行 0 col1..2 和行 1 col1..2 被填充
+        assert_eq!(app.buffer.get_range(1, 2), &[0xFF, 0xFF], "行 0 块选区应被填充");
+        assert_eq!(app.buffer.get_range(17, 2), &[0xFF, 0xFF], "行 1 块选区应被填充");
+        // 选区外字节应保持不变
+        assert_eq!(app.buffer.get_range(0, 1), &[0x00], "行 0 col0 不应被修改");
+        assert_eq!(app.buffer.get_range(3, 1), &[0x00], "行 0 col3 不应被修改");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug 复现测试（Task #29）
+    // -----------------------------------------------------------------------
+
+    /// Bug1 复现: Block 模式 G 改变列宽
+    #[test]
+    fn bug1_block_g_changes_column_width() {
+        // 85 bytes → last byte at offset 84, col = 84 % 16 = 4
+        let mut app = app_with_data(&[0u8; 85]);
+        // :block at offset 0
+        app.mode = Mode::Command;
+        app.command_input = "block".to_string();
+        let _ = handle_input(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.visual_kind, Some(VisualKind::Block));
+        assert_eq!(app.block_col_anchor, Some(0));
+        assert_eq!(app.cursor_offset, 0);
+
+        // l: move right → cursor at offset 1, col 1
+        let _ = handle_input(&mut app, key('l'));
+        assert_eq!(app.cursor_offset, 1);
+        let rect_before = app.block_rect().unwrap();
+        let width_before = rect_before.3 - rect_before.2 + 1; // max_col - min_col + 1
+        assert_eq!(width_before, 2, "l 后块宽应为 2 列 (col 0..1)");
+
+        // G: jump to last row → should preserve column
+        let _ = handle_input(&mut app, key('G'));
+        let rect_after = app.block_rect().unwrap();
+        let width_after = rect_after.3 - rect_after.2 + 1;
+        assert_eq!(width_after, 2, "G 后块宽应仍为 2 列，不应变为 {}", width_after);
+        // cursor should be on last row, same column
+        let expected_last_row = (85 - 1) / 16; // row 5
+        assert_eq!(app.cursor_offset / 16, expected_last_row, "cursor 应在最后一行");
+        assert_eq!(app.cursor_offset % 16, 1, "cursor 列应保持为 1");
+    }
+
+    /// Bug1 帧模式: Block 模式 G 同样保持帧内列宽不变（末帧短时钳制）
+    #[test]
+    fn bug1_block_g_frame_mode_preserves_column() {
+        // 3 帧：10 + 10 + 5 = 25 字节，末帧只有 5 字节（col0..col4）
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&[0u8; 25]);
+        let index = crate::frame::build_frame_index(
+            app.buffer.data(),
+            &crate::frame::FrameConfig::FixedLength { length: 10 },
+        );
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+
+        // :block 在帧 0/col1，l 选中 1 列 → 块宽 2 列（col1..2）
+        app.cursor_offset = 1;
+        crate::command::execute_command(&mut app, "block").unwrap();
+        let _ = handle_input(&mut app, key('l'));
+        let (_, _, min_col, max_col) = app.block_rect().unwrap();
+        assert_eq!(max_col - min_col + 1, 2, "l 后块宽应为 2 列");
+        let width_before = max_col - min_col + 1;
+
+        // G 跳到末帧：光标列保持为 2（末帧长 5 容纳得下），块宽不变
+        let _ = handle_input(&mut app, key('G'));
+        assert_eq!(app.cursor_offset, 22, "光标应在末帧 col2（帧 2 起始 20 + 2）");
+        let (_, _, min_col, max_col) = app.block_rect().unwrap();
+        assert_eq!(max_col - min_col + 1, width_before, "G 后块宽应保持为 2 列");
+
+        // 上移一帧后右移到 col7（超出末帧长 5），G 应钳制到末帧 col4 而非末字节外/拉宽
+        let _ = handle_input(&mut app, key('k')); // 帧 1/col2（帧长 10）
+        for _ in 0..5 {
+            let _ = handle_input(&mut app, key('l'));
+        }
+        assert_eq!(app.cursor_offset, 17, "应位于帧 1/col7");
+        let _ = handle_input(&mut app, key('G'));
+        assert_eq!(app.cursor_offset, 24, "G 应钳制到末帧 col4（末帧长 5）");
+        let (_, _, _, max_col) = app.block_rect().unwrap();
+        assert_eq!(max_col, 4, "末帧短时应钳制到 col4");
+    }
+
+    /// 帧模式块粘贴: 被粘贴帧长度增长（L24→L25 语义），后续帧 offset 右移，数据保持对齐；
+    /// `u`/`Ctrl+R` 同步恢复/重新增长帧长
+    #[test]
+    fn block_paste_frame_mode_grows_frame_lengths() {
+        // 3 帧：10 + 10 + 5 = 25 字节
+        let mut data = vec![0u8; 25];
+        for (i, b) in data.iter_mut().enumerate() { *b = i as u8; }
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&data);
+        let index = crate::frame::build_frame_index(
+            app.buffer.data(),
+            &crate::frame::FrameConfig::FixedLength { length: 10 },
+        );
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+
+        // 块选区：帧 0..1 的 col2（1 列）
+        app.mode = Mode::Visual;
+        app.visual_kind = Some(VisualKind::Block);
+        app.visual_anchor = Some(2); // 帧 0/col2
+        app.block_col_anchor = Some(2);
+        app.cursor_offset = 12; // 帧 1/col2
+        let _ = handle_input(&mut app, key('y'));
+        match &app.yank_buffer {
+            YankBuffer::Block(rows) => assert_eq!(rows.len(), 2, "应复制 2 帧"),
+            _ => panic!("Block y 应产生 YankBuffer::Block"),
+        }
+
+        // 在帧 0/col4 粘贴 → 帧 0、帧 1 各在 col5 处插入 1 字节
+        app.cursor_offset = 4;
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.len(), 27, "应插入 2 字节");
+
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames.len(), 3, "帧数不应变化");
+        assert_eq!(fi.frames[0].length, 11, "帧 0 应增长为 11（L10→L11）");
+        assert_eq!(fi.frames[1].length, 11, "帧 1 应增长为 11");
+        assert_eq!(fi.frames[1].offset, 11, "帧 1 offset 应右移");
+        assert_eq!(fi.frames[2].offset, 22, "帧 2 offset 应右移 2");
+        assert_eq!(fi.frames[2].length, 5, "帧 2 长度不变");
+        // 数据对齐：各帧首字节仍是原帧首字节
+        assert_eq!(app.buffer.get_byte(fi.frames[1].offset), Some(10));
+        assert_eq!(app.buffer.get_byte(fi.frames[2].offset), Some(20));
+
+        // u 恢复帧长
+        editor::undo(&mut app);
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, 10, "u 后帧 0 应恢复 10");
+        assert_eq!(fi.frames[1].offset, 10);
+        assert_eq!(fi.frames[2].offset, 20);
+        assert_eq!(app.buffer.data(), &data[..], "u 应完整还原数据");
+
+        // Ctrl+R 重新增长
+        editor::redo(&mut app);
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, 11, "redo 后帧 0 应再增长");
+        assert_eq!(fi.frames[2].offset, 22);
+    }
+
+    /// 帧模式块删除: 被删帧长度收缩，后续帧 offset 左移；`u` 恢复
+    #[test]
+    fn block_delete_frame_mode_shrinks_frame_lengths() {
+        let mut data = vec![0u8; 25];
+        for (i, b) in data.iter_mut().enumerate() { *b = i as u8; }
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&data);
+        let index = crate::frame::build_frame_index(
+            app.buffer.data(),
+            &crate::frame::FrameConfig::FixedLength { length: 10 },
+        );
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+
+        // 块选区：帧 0..1 的 col2
+        app.mode = Mode::Visual;
+        app.visual_kind = Some(VisualKind::Block);
+        app.visual_anchor = Some(2);
+        app.block_col_anchor = Some(2);
+        app.cursor_offset = 12;
+
+        let _ = handle_input(&mut app, key('d'));
+        assert_eq!(app.buffer.len(), 23, "应删 2 字节");
+
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, 9, "帧 0 应收缩为 9");
+        assert_eq!(fi.frames[1].length, 9, "帧 1 应收缩为 9");
+        assert_eq!(fi.frames[1].offset, 9, "帧 1 offset 应左移");
+        assert_eq!(fi.frames[2].offset, 18, "帧 2 offset 应左移 2");
+        assert_eq!(fi.frames[2].length, 5);
+        // 对齐：帧 1 首字节仍是原字节 10（删的是 col2）
+        assert_eq!(app.buffer.get_byte(fi.frames[1].offset), Some(10));
+        assert_eq!(app.buffer.get_byte(fi.frames[2].offset), Some(20));
+
+        editor::undo(&mut app);
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, 10, "u 后帧 0 应恢复 10");
+        assert_eq!(fi.frames[2].offset, 20);
+        assert_eq!(app.buffer.data(), &data[..]);
+    }
+
+    /// 帧模式性能回归: 1.8MB / L24（≈78643 帧）块粘贴/撤销不应 O(帧数²) 假死
+    #[test]
+    fn block_paste_frame_mode_large_is_fast() {
+        let frame_len = 24usize;
+        let n = 1800 * 1024usize; // 1.8MB
+        let rows = n / frame_len;
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&vec![0u8; n]);
+        let index = crate::frame::build_frame_index(
+            app.buffer.data(),
+            &crate::frame::FrameConfig::FixedLength { length: frame_len },
+        );
+        assert_eq!(index.frames.len(), rows);
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+
+        // 块选区：全文件 1 列（col 3）
+        setup_block_selection(&mut app, 3, (rows - 1) * frame_len + 3, 3);
+        let _ = handle_input(&mut app, key('y'));
+
+        app.cursor_offset = 5; // 首帧某列
+        let start = std::time::Instant::now();
+        let _ = handle_input(&mut app, key('p'));
+        let p_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n + rows, "每帧应插入 1 字节");
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, frame_len + 1, "首帧应增长为 25");
+        assert_eq!(fi.frames[1].offset, frame_len + 1, "第二帧 offset 应右移");
+        assert!(p_elapsed.as_secs() < 2, "帧模式块粘贴耗时 {:?}，不应 O(帧数²) 假死", p_elapsed);
+
+        let start = std::time::Instant::now();
+        editor::undo(&mut app);
+        let u_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n, "u 应还原");
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, frame_len, "u 后帧长应恢复 24");
+        assert_eq!(fi.frames[1].offset, frame_len);
+        assert!(u_elapsed.as_secs() < 2, "帧模式撤销耗时 {:?}，不应 O(帧数²) 假死", u_elapsed);
+    }
+
+    /// 块插入会话性能回归: 1.8MB / L24（≈78643 帧）会话应用/撤销/重做不应 O(帧数²)/O(段数×n) 假死
+    #[test]
+    fn block_insert_session_large_is_fast() {
+        let frame_len = 24usize;
+        let n = 1800 * 1024usize; // 1.8MB
+        let rows = n / frame_len;
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&vec![0u8; n]);
+        let index = crate::frame::build_frame_index(
+            app.buffer.data(),
+            &crate::frame::FrameConfig::FixedLength { length: frame_len },
+        );
+        assert_eq!(index.frames.len(), rows);
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+
+        // 块选区：全文件 1 列（col 3），i 进入块插入会话，键入 0xAB 后 Esc 应用到所有段
+        setup_block_selection(&mut app, 3, (rows - 1) * frame_len + 3, 3);
+        let _ = handle_input(&mut app, key('i'));
+        let _ = handle_input(&mut app, key('a'));
+        let _ = handle_input(&mut app, key('b'));
+        let start = std::time::Instant::now();
+        let _ = handle_input(&mut app, esc());
+        let apply_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n + rows, "每段应插入 1 字节");
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, frame_len + 1, "首帧应增长为 25");
+        assert_eq!(fi.frames[1].offset, frame_len + 1, "第二帧 offset 应右移");
+        assert!(apply_elapsed.as_secs() < 2, "块插入会话应用耗时 {:?}", apply_elapsed);
+
+        let start = std::time::Instant::now();
+        editor::undo(&mut app);
+        let u_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n, "一次 u 应整组还原（键入段 + 批量段）");
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, frame_len, "u 后帧长应恢复 24");
+        assert_eq!(fi.frames[1].offset, frame_len);
+        assert!(u_elapsed.as_secs() < 2, "块插入会话撤销耗时 {:?}", u_elapsed);
+
+        let start = std::time::Instant::now();
+        editor::redo(&mut app);
+        let r_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n + rows, "一次 Ctrl+R 应重放整组");
+        let fi = app.frame_index.as_ref().unwrap();
+        assert_eq!(fi.frames[0].length, frame_len + 1, "重做后帧长应为 25");
+        assert!(r_elapsed.as_secs() < 2, "块插入会话重做耗时 {:?}", r_elapsed);
+    }
+
+    /// 块插入会话撤销/重做的数据一致性（小场景逐字节校验）
+    #[test]
+    fn block_insert_session_undo_redo_restores() {
+        let mut app = app_with_data(&[0x00; 48]); // 3 行 × 16 字节
+        let original = app.buffer.data().to_vec();
+        setup_block_selection(&mut app, 1, 33, 1);
+        let _ = handle_input(&mut app, key('i'));
+        let _ = handle_input(&mut app, key('a'));
+        let _ = handle_input(&mut app, key('b'));
+        let _ = handle_input(&mut app, esc());
+        assert_eq!(app.buffer.len(), 51, "三段各插入 1 字节");
+        // 每行 col1 左边缘均应为 0xAB：行 0 键入于 1；
+        // 行 1/2 需换算键入位移，落在键入后坐标 18/35
+        assert_eq!(app.buffer.get_range(1, 1), &[0xAB]);
+        assert_eq!(app.buffer.get_range(18, 1), &[0xAB]);
+        assert_eq!(app.buffer.get_range(35, 1), &[0xAB]);
+
+        editor::undo(&mut app);
+        assert_eq!(app.buffer.data(), &original[..], "一次 u 应完全还原");
+        editor::redo(&mut app);
+        assert_eq!(app.buffer.len(), 51, "一次 Ctrl+R 应重新插入");
+        assert_eq!(app.buffer.get_range(1, 1), &[0xAB]);
+        assert_eq!(app.buffer.get_range(18, 1), &[0xAB]);
+        assert_eq!(app.buffer.get_range(35, 1), &[0xAB]);
+    }
+
+    /// 块追加会话（a）回归: 其余行应插在选中列右侧（换算键入位移），不得左偏一列
+    #[test]
+    fn block_append_session_inserts_after_column() {
+        let mut app = app_with_data(&[0x00; 48]); // 3 行 × 16 字节
+        setup_block_selection(&mut app, 1, 33, 1);
+        let _ = handle_input(&mut app, key('a'));
+        let _ = handle_input(&mut app, key('c'));
+        let _ = handle_input(&mut app, key('d'));
+        let _ = handle_input(&mut app, esc());
+        assert_eq!(app.buffer.len(), 51, "三段各插入 1 字节");
+        // 行 0 键入于 2（选中列 1 右侧）；行 1/2 的 0xCD 也应在各自选中列右侧：
+        // 原始 18/34 → 键入后 19/35 → 最终 19/36
+        assert_eq!(app.buffer.get_range(2, 1), &[0xCD]);
+        assert_eq!(app.buffer.get_range(19, 1), &[0xCD]);
+        assert_eq!(app.buffer.get_range(36, 1), &[0xCD]);
+        // 选中列字节应保持原位（行 1 col1 = 原始 17 → 键入后 18）
+        assert_eq!(app.buffer.get_range(18, 1), &[0x00]);
+        // 一次 u 整体撤销
+        editor::undo(&mut app);
+        assert_eq!(app.buffer.len(), 48, "一次 u 应完全还原");
+    }
+
+    /// Bug2 复现: 块粘贴 crash/卡死
+    #[test]
+    fn bug2_block_paste_no_panic() {
+        // 48 bytes = 3 rows of 16
+        let mut app = app_with_data(&[0u8; 48]);
+        // Block select: 3 rows, 1 column (col 3)
+        setup_block_selection(&mut app, 3, 35, 3); // anchor=row0/col3, cursor=row2/col3
+
+        // y: yank block → should get Block([3 rows × 1 byte])
+        let _ = handle_input(&mut app, key('y'));
+        match &app.yank_buffer {
+            YankBuffer::Block(rows) => {
+                assert_eq!(rows.len(), 3, "应复制 3 行");
+                assert!(rows.iter().all(|r| r.len() == 1), "每行 1 字节");
+            }
+            _ => panic!("Block y 应产生 YankBuffer::Block"),
+        }
+        assert_eq!(app.mode, Mode::Normal);
+
+        // 移到首行 col 5
+        app.cursor_offset = 5;
+
+        // p: block paste → should NOT panic
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.len(), 51, "粘贴 3 行×1 字节后应增 3 字节");
+    }
+
+    /// Bug2 额外测试: 块粘贴在行末 col=15 时
+    #[test]
+    fn bug2_block_paste_at_last_column() {
+        let mut app = app_with_data(&[0u8; 32]); // 2 rows
+        app.yank_buffer = YankBuffer::Block(vec![vec![0xAA], vec![0xBB]]);
+        app.cursor_offset = 15; // row 0, col 15
+
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.len(), 34, "粘贴 2 行×1 字节应增 2 字节");
+    }
+
+    /// Bug2 额外测试: 块粘贴行数超出 buffer 行数
+    #[test]
+    fn bug2_block_paste_more_rows_than_buffer() {
+        let mut app = app_with_data(&[0u8; 16]); // 1 row only
+        app.yank_buffer = YankBuffer::Block(vec![vec![0xAA], vec![0xBB], vec![0xCC]]);
+        app.cursor_offset = 5; // row 0, col 5
+
+        // Should not panic even though we're pasting 3 rows into a 1-row buffer
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.len(), 19, "3 字节应被插入");
+    }
+
+    /// Bug2 性能回归: 全文件单列块粘贴不应假死（批量插入，非逐行 O(n²)）
+    #[test]
+    fn bug2_block_paste_large_file_is_fast() {
+        let n = 320 * 1024usize; // 20480 行
+        let mut app = app_with_data(&vec![0u8; n]);
+        app.yank_buffer = YankBuffer::Block(vec![vec![0xAB]; n / 16]);
+        app.cursor_offset = 5; // 首行某列（用户报告的触发位置）
+
+        let start = std::time::Instant::now();
+        let _ = handle_input(&mut app, key('p'));
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs() < 2, "块粘贴耗时 {:?}，不应出现 O(n²) 假死", elapsed);
+        assert_eq!(app.buffer.len(), n + n / 16, "每行应插入 1 字节");
+    }
+
+    /// Bug2 正确性: 批量块粘贴结果与逐行语义一致，一次 `u` 可完整撤销，`Ctrl+R` 可重做
+    #[test]
+    fn bug2_block_paste_batch_undo_redo() {
+        let mut original = vec![0u8; 64]; // 4 行 × 16 字节
+        for (i, b) in original.iter_mut().enumerate() { *b = i as u8; }
+        let mut app = app_with_data(&original);
+        app.yank_buffer = YankBuffer::Block(vec![vec![0xAA], vec![0xBB], vec![0xCC]]);
+        app.cursor_offset = 2; // row 0, col 2 → 各行 col3 处插入
+
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.len(), 67, "应插入 3 字节");
+        // 各行原 col3 位置应为插入字节，行内其余字节右移收拢到本行内不影响他行
+        assert_eq!(app.buffer.get_range(3, 1), &[0xAA], "行 0 插入位置");
+        assert_eq!(app.buffer.get_range(20, 1), &[0xBB], "行 1 插入位置");
+        assert_eq!(app.buffer.get_range(37, 1), &[0xCC], "行 2 插入位置");
+        assert_eq!(app.buffer.get_range(17, 3), &[16, 17, 18], "行 1 前部不受影响");
+        assert_eq!(app.buffer.get_range(51, 3), &[48, 49, 50], "行 3 不受影响");
+        // modified 标记跟随插入点平移（插入前的修改点在插入后仍被正确标记）
+        assert!(app.buffer.is_modified(3), "新插入字节应标记 modified");
+
+        editor::undo(&mut app);
+        assert_eq!(app.buffer.data(), &original[..], "一次 u 应完整撤销块粘贴");
+        editor::redo(&mut app);
+        assert_eq!(app.buffer.len(), 67, "Ctrl+R 应完整重做块粘贴");
+        assert_eq!(app.buffer.get_range(20, 1), &[0xBB], "重做后行 1 插入位置正确");
+    }
+
+    /// Bug2 性能回归（撤销/重做）: 大文件全文件单列块粘贴后 `u`/`Ctrl+R` 不应假死
+    #[test]
+    fn bug2_block_paste_undo_redo_large_is_fast() {
+        let n = 320 * 1024usize;
+        let original = vec![0u8; n];
+        let mut app = app_with_data(&original);
+        app.yank_buffer = YankBuffer::Block(vec![vec![0xAB]; n / 16]);
+        app.cursor_offset = 5;
+
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.len(), n + n / 16);
+
+        let start = std::time::Instant::now();
+        editor::undo(&mut app);
+        let undo_elapsed = start.elapsed();
+        assert_eq!(app.buffer.data(), &original[..], "u 应完整还原原始数据");
+        assert!(undo_elapsed.as_secs() < 2, "撤销耗时 {:?}，不应出现 O(n²) 假死", undo_elapsed);
+
+        let start = std::time::Instant::now();
+        editor::redo(&mut app);
+        let redo_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n + n / 16, "Ctrl+R 应完整重新应用块粘贴");
+        assert!(redo_elapsed.as_secs() < 2, "重做耗时 {:?}，不应出现 O(n²) 假死", redo_elapsed);
+    }
+
+    /// Bug2 延伸（块删除）: 大文件块删除 / `u` / `Ctrl+R` 均不应假死且完整还原/重放
+    #[test]
+    fn bug2_block_delete_undo_redo_large_is_fast() {
+        let n = 320 * 1024usize;
+        let original = vec![0x5Au8; n];
+        let mut app = app_with_data(&original);
+        // 块选区：跨全部行的 1 列（col 3）
+        setup_block_selection(&mut app, 3, n - 16 + 3, 3);
+
+        let start = std::time::Instant::now();
+        let _ = handle_input(&mut app, key('d'));
+        let d_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n - n / 16, "应每行删 1 字节");
+        assert!(d_elapsed.as_secs() < 2, "块删除耗时 {:?}，不应 O(n²) 假死", d_elapsed);
+
+        let start = std::time::Instant::now();
+        editor::undo(&mut app);
+        let u_elapsed = start.elapsed();
+        assert_eq!(app.buffer.data(), &original[..], "u 应完整还原");
+        assert!(u_elapsed.as_secs() < 2, "撤销耗时 {:?}，不应 O(n²) 假死", u_elapsed);
+
+        let start = std::time::Instant::now();
+        editor::redo(&mut app);
+        let r_elapsed = start.elapsed();
+        assert_eq!(app.buffer.len(), n - n / 16, "Ctrl+R 应完整重新应用");
+        assert!(r_elapsed.as_secs() < 2, "重做耗时 {:?}，不应 O(n²) 假死", r_elapsed);
+    }
+
+    /// 边界: 粘贴行数超出 buffer 行数（越界行追加到末尾）时 `u`/`Ctrl+R` 仍完整还原/重放
+    #[test]
+    fn block_paste_beyond_eof_undo_redo_restores() {
+        let mut original = vec![0u8; 20]; // 1 整行 + 尾行 4 字节（触发末行钳制）
+        for (i, b) in original.iter_mut().enumerate() { *b = i as u8; }
+        let mut app = app_with_data(&original);
+        app.yank_buffer = YankBuffer::Block(vec![vec![0xA1], vec![0xB2], vec![0xC3]]);
+        app.cursor_offset = 5; // row 0, col 5
+
+        let _ = handle_input(&mut app, key('p'));
+        assert_eq!(app.buffer.len(), 23, "应插入 3 字节");
+        assert_eq!(app.buffer.get_range(6, 1), &[0xA1], "行 0 应在光标列后插入");
+        assert_eq!(app.buffer.get_range(21, 2), &[0xC3, 0xB2], "越界行应追加到末尾");
+
+        editor::undo(&mut app);
+        assert_eq!(app.buffer.data(), &original[..], "u 应完整还原");
+        editor::redo(&mut app);
+        assert_eq!(app.buffer.len(), 23, "Ctrl+R 应完整重放");
+        assert_eq!(app.buffer.get_range(6, 1), &[0xA1], "重做后行 0 插入位置正确");
+        assert_eq!(app.buffer.get_range(21, 2), &[0xC3, 0xB2], "重做后越界行顺序正确");
+    }
+
+    /// 11. 空 buffer / EOF 铗制不 panic
+    #[test]
+    fn empty_buffer_and_eof_clamp_no_panic() {
+        // 空缓冲区：块选区操作不 panic
+        let mut app = App::new();
+        app.mode = Mode::Visual;
+        app.visual_kind = Some(VisualKind::Block);
+        app.visual_anchor = Some(0);
+        app.block_col_anchor = Some(0);
+        app.cursor_offset = 0;
+
+        // selection_segments() 在空缓冲区不 panic
+        let _segs = app.selection_segments();
+
+        // selection_range() 不 panic
+        let _range = app.selection_range();
+
+        // Block yank 在空缓冲区不 panic
+        let _ = handle_input(&mut app, key('y'));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Block delete 在空缓冲区不 panic
+        let mut app = App::new();
+        app.mode = Mode::Visual;
+        app.visual_kind = Some(VisualKind::Block);
+        app.visual_anchor = Some(0);
+        app.block_col_anchor = Some(0);
+        app.cursor_offset = 0;
+        let _ = handle_input(&mut app, key('d'));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // Ctrl+P 在空缓冲区不 panic
+        let mut app = App::new();
+        app.yank_buffer = YankBuffer::Flat(vec![0xFF]);
+        app.cursor_offset = 0;
+        let _ = handle_input(&mut app, ctrl_p()); // 不应 panic
+
+        // Ctrl+P Block 在空缓冲区不 panic
+        let mut app = App::new();
+        app.yank_buffer = YankBuffer::Block(vec![vec![0xFF]]);
+        app.cursor_offset = 0;
+        let _ = handle_input(&mut app, ctrl_p()); // 不应 panic
     }
 }
 

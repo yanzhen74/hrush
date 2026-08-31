@@ -1,9 +1,10 @@
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, VisualKind};
 use crate::buffer::FileSource;
 use crate::checksum::{self, ChecksumInfo};
 use crate::editor;
@@ -14,6 +15,8 @@ use crate::search::{self, SearchPattern};
 pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
     // Visual 模式按 `:` 进入时暂存的选区范围：任何命令执行后即消费（仅校验和命令使用）
     let pending_range = app.pending_range.take();
+    // Block 模式额外暂存的逐段选区（:fill/:set/校验和逐段操作优先使用）
+    let pending_segments = app.pending_segments.take();
 
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -112,7 +115,8 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         }
         "sum" | "checksum" => {
             let range = checksum_range(app, pending_range);
-            app.sum_info = Some(make_checksum_info(app, range));
+            let data = checksum_bytes(app, pending_range, &pending_segments);
+            app.sum_info = Some(make_checksum_info(&data, range, app.type_endian_le));
             app.sum_open = true;
         }
         "list" | "matches" => {
@@ -121,8 +125,8 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         "crc16" => {
             match parse_crc_args(16, &parts[1..]) {
                 Ok((params, label)) => {
-                    let data = checksum_data(app, checksum_range(app, pending_range));
-                    let value = checksum::crc(data, &params) as u16;
+                    let data = checksum_bytes(app, pending_range, &pending_segments);
+                    let value = checksum::crc(&data, &params) as u16;
                     app.message = Some((
                         format!("CRC16 ({}): {:04X}", label, value),
                         Instant::now(),
@@ -136,8 +140,8 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         "crc32" => {
             match parse_crc_args(32, &parts[1..]) {
                 Ok((params, label)) => {
-                    let data = checksum_data(app, checksum_range(app, pending_range));
-                    let value = checksum::crc(data, &params) as u32;
+                    let data = checksum_bytes(app, pending_range, &pending_segments);
+                    let value = checksum::crc(&data, &params) as u32;
                     app.message = Some((
                         format!("CRC32 ({}): {:08X}", label, value),
                         Instant::now(),
@@ -149,30 +153,30 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
             }
         }
         "md5" => {
-            let data = checksum_data(app, checksum_range(app, pending_range));
-            app.message = Some((format!("MD5: {}", checksum::md5(data)), Instant::now()));
+            let data = checksum_bytes(app, pending_range, &pending_segments);
+            app.message = Some((format!("MD5: {}", checksum::md5(&data)), Instant::now()));
         }
         "sha256" => {
-            let data = checksum_data(app, checksum_range(app, pending_range));
-            app.message = Some((format!("SHA256: {}", checksum::sha256(data)), Instant::now()));
+            let data = checksum_bytes(app, pending_range, &pending_segments);
+            app.message = Some((format!("SHA256: {}", checksum::sha256(&data)), Instant::now()));
         }
         "sum8" => {
-            let data = checksum_data(app, checksum_range(app, pending_range));
-            app.message = Some((format!("SUM8: {:02X}", checksum::sum8(data)), Instant::now()));
+            let data = checksum_bytes(app, pending_range, &pending_segments);
+            app.message = Some((format!("SUM8: {:02X}", checksum::sum8(&data)), Instant::now()));
         }
         "sum16" => {
-            let data = checksum_data(app, checksum_range(app, pending_range));
+            let data = checksum_bytes(app, pending_range, &pending_segments);
             let endian = if app.type_endian_le { "LE" } else { "BE" };
             app.message = Some((
-                format!("SUM16 ({}): {:04X}", endian, checksum::sum16(data, app.type_endian_le)),
+                format!("SUM16 ({}): {:04X}", endian, checksum::sum16(&data, app.type_endian_le)),
                 Instant::now(),
             ));
         }
         "sum32" => {
-            let data = checksum_data(app, checksum_range(app, pending_range));
+            let data = checksum_bytes(app, pending_range, &pending_segments);
             let endian = if app.type_endian_le { "LE" } else { "BE" };
             app.message = Some((
-                format!("SUM32 ({}): {:08X}", endian, checksum::sum32(data, app.type_endian_le)),
+                format!("SUM32 ({}): {:08X}", endian, checksum::sum32(&data, app.type_endian_le)),
                 Instant::now(),
             ));
         }
@@ -184,36 +188,72 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
             if value > 0xFF {
                 bail!("Fill value exceeds 0xFF");
             }
-            let (start, end) = selection_only_range(app, pending_range)
-                .ok_or_else(|| anyhow::anyhow!("No selection for :fill"))?;
-            let len = end - start + 1;
-            app.undo_manager.begin_group("fill selection");
-            for i in 0..len {
-                editor::set_byte(app, start + i, value as u8);
+            if let Some(segments) = &pending_segments {
+                // Block 选区：逐段填充
+                app.undo_manager.begin_group("fill selection");
+                let mut total_len = 0usize;
+                for &(start, end) in segments {
+                    let len = end - start + 1;
+                    for i in 0..len {
+                        editor::set_byte(app, start + i, value as u8);
+                    }
+                    total_len += len;
+                }
+                app.undo_manager.end_group();
+                app.message = Some((
+                    format!("Filled {} byte(s) with {:02X}", total_len, value as u8),
+                    Instant::now(),
+                ));
+            } else {
+                let (start, end) = selection_only_range(app, pending_range)
+                    .ok_or_else(|| anyhow::anyhow!("No selection for :fill"))?;
+                let len = end - start + 1;
+                app.undo_manager.begin_group("fill selection");
+                for i in 0..len {
+                    editor::set_byte(app, start + i, value as u8);
+                }
+                app.undo_manager.end_group();
+                app.message = Some((
+                    format!("Filled {} byte(s) with {:02X}", len, value as u8),
+                    Instant::now(),
+                ));
             }
-            app.undo_manager.end_group();
-            app.message = Some((
-                format!("Filled {} byte(s) with {:02X}", len, value as u8),
-                Instant::now(),
-            ));
         }
         "set" => {
             if parts.len() < 2 {
                 bail!("Usage: :set HEXBYTES");
             }
             let bytes = parse_hex_bytes(&parts[1..].join(" "))?;
-            let (start, end) = selection_only_range(app, pending_range)
-                .ok_or_else(|| anyhow::anyhow!("No selection for :set"))?;
-            let len = end - start + 1;
-            app.undo_manager.begin_group("set selection");
-            for i in 0..len {
-                editor::set_byte(app, start + i, bytes[i % bytes.len()]);
+            if let Some(segments) = &pending_segments {
+                // Block 选区：逐段循环覆盖
+                app.undo_manager.begin_group("set selection");
+                let mut total_len = 0usize;
+                for &(start, end) in segments {
+                    let len = end - start + 1;
+                    for i in 0..len {
+                        editor::set_byte(app, start + i, bytes[i % bytes.len()]);
+                    }
+                    total_len += len;
+                }
+                app.undo_manager.end_group();
+                app.message = Some((
+                    format!("Set {} byte(s) with pattern", total_len),
+                    Instant::now(),
+                ));
+            } else {
+                let (start, end) = selection_only_range(app, pending_range)
+                    .ok_or_else(|| anyhow::anyhow!("No selection for :set"))?;
+                let len = end - start + 1;
+                app.undo_manager.begin_group("set selection");
+                for i in 0..len {
+                    editor::set_byte(app, start + i, bytes[i % bytes.len()]);
+                }
+                app.undo_manager.end_group();
+                app.message = Some((
+                    format!("Set {} byte(s) with pattern", len),
+                    Instant::now(),
+                ));
             }
-            app.undo_manager.end_group();
-            app.message = Some((
-                format!("Set {} byte(s) with pattern", len),
-                Instant::now(),
-            ));
         }
         "frame" => {
             if parts.len() >= 2 {
@@ -265,6 +305,21 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
                 app.message = Some(("Usage: :frame len=N | :frame sync=HEX | :frame off".to_string(), Instant::now()));
             }
         }
+        "block" => {
+            app.mode = Mode::Visual;
+            app.visual_anchor = Some(app.cursor_offset);
+            app.visual_kind = Some(VisualKind::Block);
+            let col = if app.is_frame_mode() {
+                app.current_frame().map_or(0, |f| app.cursor_offset - f.offset)
+            } else {
+                app.cursor_offset % 16
+            };
+            app.block_col_anchor = Some(col);
+        }
+        "overpaste" | "op" => {
+            // Ctrl+P 在被 IDE/终端截获的环境不可用，提供命令入口
+            crate::input::do_overwrite_paste(app);
+        }
         _ => {
             // 尝试解析为替换命令 :s/old/new 或 :%s/old/new/g
             if let Some((global, old, new)) = parse_substitute(trimmed) {
@@ -282,6 +337,8 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         }
     }
 
+    // 防止残留：确保 pending_segments 在任何命令执行后清空
+    app.pending_segments = None;
     Ok(())
 }
 
@@ -354,6 +411,30 @@ fn selection_only_range(app: &App, pending_range: Option<(usize, usize)>) -> Opt
     pending_range.or_else(|| app.selection_range())
 }
 
+/// 校验和计算字节：pending_segments（逐段拼接）优先，其次 pending_range / 活动选区切片，
+/// 否则全文。空缓冲区返回空切片。
+fn checksum_bytes<'a>(
+    app: &'a App,
+    pending_range: Option<(usize, usize)>,
+    pending_segments: &Option<Vec<(usize, usize)>>,
+) -> Cow<'a, [u8]> {
+    if app.buffer.is_empty() {
+        return Cow::Borrowed(&[]);
+    }
+    if let Some(segments) = pending_segments {
+        let mut data = Vec::new();
+        for &(start, end) in segments {
+            if end >= start && start < app.buffer.len() {
+                let len = (end - start + 1).min(app.buffer.len() - start);
+                data.extend_from_slice(app.buffer.get_range(start, len));
+            }
+        }
+        Cow::Owned(data)
+    } else {
+        Cow::Borrowed(checksum_data(app, checksum_range(app, pending_range)))
+    }
+}
+
 /// 按范围取字节切片（含两端），越界由 get_range 钳制，空缓冲区返回空切片
 fn checksum_data(app: &App, range: (usize, usize)) -> &[u8] {
     let (start, end) = range;
@@ -365,9 +446,7 @@ fn checksum_data(app: &App, range: (usize, usize)) -> &[u8] {
 
 /// 构造校验和浮层快照：CRC16 用 CCITT-FALSE、CRC32 用 IEEE；
 /// SUM16/SUM32 按当前全局端序（type_endian_le）取字，端序随快照记录以便浮层标注。
-fn make_checksum_info(app: &App, range: (usize, usize)) -> ChecksumInfo {
-    let data = checksum_data(app, range);
-    let le = app.type_endian_le;
+fn make_checksum_info(data: &[u8], range: (usize, usize), type_endian_le: bool) -> ChecksumInfo {
     ChecksumInfo {
         range,
         len: data.len(),
@@ -376,9 +455,9 @@ fn make_checksum_info(app: &App, range: (usize, usize)) -> ChecksumInfo {
         md5: checksum::md5(data),
         sha256: checksum::sha256(data),
         sum8: format!("{:02X}", checksum::sum8(data)),
-        sum16: format!("{:04X}", checksum::sum16(data, le)),
-        sum32: format!("{:08X}", checksum::sum32(data, le)),
-        sum_le: le,
+        sum16: format!("{:04X}", checksum::sum16(data, type_endian_le)),
+        sum32: format!("{:08X}", checksum::sum32(data, type_endian_le)),
+        sum_le: type_endian_le,
     }
 }
 
@@ -709,6 +788,8 @@ fn parse_hex_bytes(hex_str: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::VisualKind;
+    use crate::app::YankBuffer;
     use crate::buffer::Buffer;
 
     /// 构造带数据的 App（直接构造 Buffer 避免留下编辑/undo 记录）
@@ -884,6 +965,7 @@ mod tests {
     fn md5_command_uses_visual_selection() {
         let mut app = app_with_data(b"xabc");
         app.visual_anchor = Some(1);
+        app.visual_kind = Some(VisualKind::Char);
         app.cursor_offset = 3;
         execute_command(&mut app, "md5").unwrap();
         let (msg, _) = app.message.as_ref().unwrap();
@@ -954,6 +1036,7 @@ mod tests {
     fn sum_command_uses_visual_selection() {
         let mut app = app_with_data(b"xabc");
         app.visual_anchor = Some(3);
+        app.visual_kind = Some(VisualKind::Char);
         app.cursor_offset = 1; // anchor > cursor，验证范围自动排序
         execute_command(&mut app, "sum").unwrap();
         let info = app.sum_info.as_ref().unwrap();
@@ -1010,6 +1093,7 @@ mod tests {
     fn sum16_command_uses_visual_selection() {
         let mut app = app_with_data(&[0xAA, 0x01, 0x02, 0x03]);
         app.visual_anchor = Some(1);
+        app.visual_kind = Some(VisualKind::Char);
         app.cursor_offset = 3;
         execute_command(&mut app, "sum16").unwrap();
         assert_eq!(app.message.as_ref().unwrap().0, "SUM16 (LE): 0204");
@@ -1025,6 +1109,7 @@ mod tests {
     fn fill_command_fills_selection_and_undoes_in_one_step() {
         let mut app = app_with_data(&[0u8; 8]);
         app.visual_anchor = Some(2);
+        app.visual_kind = Some(VisualKind::Char);
         app.cursor_offset = 5;
         execute_command(&mut app, "fill 0xFF").unwrap();
         assert_eq!(app.buffer.data(), &[0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0]);
@@ -1052,6 +1137,7 @@ mod tests {
     fn set_command_cycles_pattern_over_selection() {
         let mut app = app_with_data(&[0u8; 8]);
         app.visual_anchor = Some(1);
+        app.visual_kind = Some(VisualKind::Char);
         app.cursor_offset = 5; // 选区 1..=5（5 字节）
         execute_command(&mut app, "set AABB").unwrap();
         assert_eq!(
@@ -1104,5 +1190,83 @@ mod tests {
         app.pending_range = Some((0, 1));
         execute_command(&mut app, "fill 0x5A").unwrap();
         assert_eq!(app.buffer.get_range(0, 2), &[0x5A, 0x5A]);
+    }
+
+    // -----------------------------------------------------------------------
+    // :block 回归测试（Task #28）
+    // -----------------------------------------------------------------------
+
+    /// `:block` 进入 Visual Block 模式：mode == Visual、visual_kind == Block、
+    /// visual_anchor == 当前光标、block_col_anchor == cursor % 16（非帧模式）
+    #[test]
+    fn block_command_enters_visual_block_mode() {
+        let mut app = app_with_data(&[0u8; 64]);
+        app.cursor_offset = 35; // row 2, col 3
+        execute_command(&mut app, "block").unwrap();
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(app.visual_kind, Some(VisualKind::Block));
+        assert_eq!(app.visual_anchor, Some(35));
+        assert_eq!(app.block_col_anchor, Some(35 % 16)); // col 3
+    }
+
+    /// `:block` 在光标为 0 时 col 为 0
+    #[test]
+    fn block_command_at_origin() {
+        let mut app = app_with_data(&[0u8; 16]);
+        app.cursor_offset = 0;
+        execute_command(&mut app, "block").unwrap();
+        assert_eq!(app.mode, Mode::Visual);
+        assert_eq!(app.visual_kind, Some(VisualKind::Block));
+        assert_eq!(app.visual_anchor, Some(0));
+        assert_eq!(app.block_col_anchor, Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // :overpaste 回归测试（Ctrl+P 的命令入口）
+    // -----------------------------------------------------------------------
+
+    /// `:overpaste` Flat yank：从光标覆盖、不增长文件、一次 u 还原
+    #[test]
+    fn overpaste_command_flat_overwrites() {
+        let mut app = app_with_data(&[0u8; 16]);
+        app.yank_buffer = YankBuffer::Flat(vec![0xAA, 0xBB, 0xCC]);
+        app.cursor_offset = 2;
+        execute_command(&mut app, "overpaste").unwrap();
+        assert_eq!(app.buffer.len(), 16, "覆盖粘贴不增长文件");
+        assert_eq!(app.buffer.get_range(2, 3), &[0xAA, 0xBB, 0xCC]);
+        crate::editor::undo(&mut app);
+        assert_eq!(app.buffer.get_range(2, 3), &[0, 0, 0], "一次 u 应还原");
+    }
+
+    /// `:overpaste` EOF 截断：yank 超出文件尾只覆盖到 EOF
+    #[test]
+    fn overpaste_command_clamps_at_eof() {
+        let mut app = app_with_data(&[0u8; 4]);
+        app.yank_buffer = YankBuffer::Flat(vec![1, 2, 3, 4, 5]);
+        app.cursor_offset = 2;
+        execute_command(&mut app, "op").unwrap();
+        assert_eq!(app.buffer.len(), 4);
+        assert_eq!(app.buffer.get_range(2, 2), &[1, 2]);
+    }
+
+    /// `:overpaste` Block yank：自光标行/列逐行覆盖
+    #[test]
+    fn overpaste_command_block_overwrites_rows() {
+        let mut app = app_with_data(&[0u8; 48]);
+        app.yank_buffer = YankBuffer::Block(vec![vec![0x11, 0x12], vec![0x21]]);
+        app.cursor_offset = 17; // row 1, col 1
+        execute_command(&mut app, "overpaste").unwrap();
+        assert_eq!(app.buffer.len(), 48);
+        assert_eq!(app.buffer.get_range(17, 2), &[0x11, 0x12]);
+        assert_eq!(app.buffer.get_range(33, 1), &[0x21]);
+    }
+
+    /// `:overpaste` 空 yank：提示 Nothing yanked 且不改缓冲
+    #[test]
+    fn overpaste_command_nothing_yanked() {
+        let mut app = app_with_data(&[7u8; 8]);
+        execute_command(&mut app, "overpaste").unwrap();
+        assert!(app.message.is_some(), "应提示 Nothing yanked");
+        assert_eq!(app.buffer.get_range(0, 8), &[7u8; 8]);
     }
 }

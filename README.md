@@ -20,7 +20,10 @@
 - **Append Insert (`a`)** — Press `a` to insert after cursor, just like Vim's append mode.
 - **Search Progress Bar** — Async search with real-time progress display (percentage + match count), cancelable with `Esc`.
 - **Count Prefix** — Type a number before commands to repeat them (e.g., `3l`, `5h`, `2dd`, `3x`), just like Vim.
-- **Visual Mode** — Press `v` to enter Visual mode for byte selection. Use movement keys to extend selection, `y` to yank (copy), `d` to cut, and `p` to paste.
+- **Visual Mode** — Press `v` to select bytes, `V` for whole-line selection, `Ctrl+V` (or `:block`) for rectangular block selection. Use movement keys to extend selection, `y` to yank (copy), `d` to cut, and `p` to paste.
+- **Block (Rectangular) Editing** — Yank/cut/paste rectangular blocks; `p` pastes a block row-by-row at the cursor, `Ctrl+P` (or `:overpaste`) overwrites without growing the file. In block mode, `i`/`a` insert/append the typed bytes across every selected row, undone as a single change.
+- **Checksums** — Compute `:sum8/:sum16/:sum32`, `:crc16` (configurable poly/init/refin/refout/xorout), `:crc32`, `:md5`, `:sha256` over the selection or the whole file.
+- **Repeat Last Change** — `.` repeats the last edit (supports count prefix, e.g., `3.`).
 - **Built-in Help System** — Press `?` or `F1` for full-screen help with all keybindings and commands. Use `:help [topic]` to jump to specific topics. Status bar displays the current mode with color-coded indicators.
 
 ## Screenshot
@@ -95,8 +98,12 @@ hrush --import hex.txt
 | `n` | Jump to next search match |
 | `N` | Jump to previous search match |
 | `v` | Enter Visual mode (select bytes) |
+| `V` | Enter Visual Line mode (select whole rows/frames) |
+| `Ctrl+V` | Enter Visual Block mode (rectangular selection; use `:block` if the terminal intercepts it) |
+| `p` | Paste yanked bytes after cursor (row-by-row for block yanks) |
+| `Ctrl+P` | Overwrite paste, no file growth, clamped at EOF (use `:overpaste` if the terminal intercepts it) |
+| `.` | Repeat last change (with optional count prefix) |
 | `?` / `F1` | Open help page |
-| `p` | Paste yanked bytes after cursor |
 | `1-9` | Count prefix for repeating commands |
 | `:` | Enter Command mode |
 
@@ -127,8 +134,12 @@ hrush --import hex.txt
 | `0` | Extend selection to start of line |
 | `$` | Extend selection to end of line |
 | `G` | Extend selection to end of file |
+| `v` / `V` / `Ctrl+V` | Switch between char / line / block selection (anchor unchanged) |
 | `y` | Yank (copy) selection |
 | `d`, `x` | Delete (cut) selection |
+| `i` | Block insert at the left edge (block mode only; typed bytes are applied to every selected row) |
+| `a` | Block append at the right edge (block mode only) |
+| `:` | Enter Command mode; checksum / `:fill` / `:set` commands apply to the selection |
 | `Esc` | Cancel selection, return to Normal mode |
 
 ### Help Mode
@@ -162,6 +173,13 @@ Type a command after `:` and press `Enter`.
 | `:export <path>` | Export current buffer as hex text |
 | `:s/old/new` | Replace current match |
 | `:%s/old/new/g` | Replace all matches globally |
+| `:fill BYTE` | Fill selection with a byte value (hex `0xAA` or decimal `255`); requires selection |
+| `:set HEXBYTES` | Overwrite selection with repeating hex bytes, e.g. `:set AABB`; requires selection |
+| `:block` | Enter Visual Block mode (alternative to `Ctrl+V`) |
+| `:overpaste` | Overwrite paste (alternative to `Ctrl+P`); alias `:op` |
+| `:sum` / `:sum8` / `:sum16` / `:sum32` | Additive checksums; word order follows global endianness (selection or whole file) |
+| `:crc16` / `:crc32` | CRC checksums; `:crc16` supports `poly=`/`init=`/`refin=`/`refout=`/`xorout=` options |
+| `:md5` / `:sha256` | Hash the selection or whole file |
 | `:help [topic]` | Open help (topics: overview, navigation, editing, visual, search, commands, frame) |
 
 > In `:s` and `:%s` commands, both `old` and `new` support hex patterns with the `x:` prefix (e.g., `:%s/x:DEAD/x:BEEF/g`). Without the prefix, the pattern is treated as ASCII text.
@@ -239,7 +257,8 @@ All normal-mode navigation keys work in frame mode:
 
 - Insert (`i`) and Replace (`R`) work exactly as in raw mode.
 - Undo (`u`) / Redo (`Ctrl+R`) are fully supported.
-- After each edit, the frame index is automatically rebuilt so frame boundaries stay correct.
+- After each edit, frame offsets and lengths are adjusted incrementally in O(n), so rows stay aligned and the `LNN` length label reflects the edit immediately (e.g. inserting one byte per frame turns `L24` into `L25`).
+- Block paste / block insert sessions are O(n) and remain responsive even on multi-MB files with tens of thousands of frames.
 - **Caveat**: In fixed-length mode, if your edits change the total file size so it is no longer a multiple of the frame length, `:w` will warn you. Use `:w!` to force save anyway.
 
 ## License

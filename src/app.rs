@@ -27,6 +27,26 @@ pub enum Mode {
     Help,
 }
 
+/// Visual 模式的三种子类型
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VisualKind { Char, Line, Block }
+
+/// Yank 寄存器：Flat 为连续字节，Block 为逐行片段
+#[derive(Clone, Debug, PartialEq)]
+pub enum YankBuffer {
+    Flat(Vec<u8>),
+    Block(Vec<Vec<u8>>),
+}
+impl YankBuffer {
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Flat(v) => v.is_empty(),
+            Self::Block(v) => v.is_empty(),
+        }
+    }
+}
+
 /// 上一次修改的类型与内容（用于 `.` 命令重放）
 #[derive(Clone, Debug, PartialEq)]
 pub enum LastChange {
@@ -35,6 +55,13 @@ pub enum LastChange {
     ReplaceByte { value: u8 },      // r 单字节替换
     Delete { len: usize },          // x / dd / Visual d,x 删除的长度
     Paste,                          // p 粘贴（重放时用当前 yank_buffer）
+    OverwritePaste,                 // Ctrl+P 覆盖粘贴（重放时用当前 yank_buffer）
+}
+
+/// 块插入会话上下文（Visual Block i/a 进入 Insert 模式时使用）
+pub struct BlockInsertCtx {
+    pub segments: Vec<(usize, usize)>,
+    pub insert_left: bool,
 }
 
 pub struct App {
@@ -60,8 +87,9 @@ pub struct App {
     pub insert_after: bool,
     pub count_prefix: Option<usize>,
     pub visual_anchor: Option<usize>,
-    pub visual_line: bool,
-    pub yank_buffer: Vec<u8>,
+    pub visual_kind: Option<VisualKind>,
+    pub block_col_anchor: Option<usize>,
+    pub yank_buffer: YankBuffer,
     pub help_scroll: usize,
     pub help_topic: Option<String>,
     pub jump_back: Vec<usize>,
@@ -79,6 +107,9 @@ pub struct App {
     pub match_list_open: bool,
     pub match_list_sel: usize,    // 匹配列表当前选中行
     pub match_list_scroll: usize, // 匹配列表滚动偏移
+    pub block_insert_ctx: Option<BlockInsertCtx>,
+    /// Block 模式进入 Command 时暂存的逐段选区（:fill/:set/校验和优先使用）
+    pub pending_segments: Option<Vec<(usize, usize)>>,
 }
 
 impl App {
@@ -106,8 +137,9 @@ impl App {
             insert_after: false,
             count_prefix: None,
             visual_anchor: None,
-            visual_line: false,
-            yank_buffer: Vec::new(),
+            visual_kind: None,
+            block_col_anchor: None,
+            yank_buffer: YankBuffer::Flat(Vec::new()),
             help_scroll: 0,
             help_topic: None,
             jump_back: Vec::new(),
@@ -125,6 +157,8 @@ impl App {
             match_list_open: false,
             match_list_sel: 0,
             match_list_scroll: 0,
+            block_insert_ctx: None,
+            pending_segments: None,
         }
     }
 
@@ -141,27 +175,121 @@ impl App {
     }
 
     pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let kind = self.visual_kind?;
         let (mut start, mut end) = self.visual_anchor.map(|anchor| {
             (anchor.min(self.cursor_offset), anchor.max(self.cursor_offset))
         })?;
-        if self.visual_line && !self.buffer.is_empty() {
-            // 行选模式：起止吸附到行边界（帧模式按帧边界，否则按 16 字节行）
-            if self.is_frame_mode() {
-                if let Some(fi) = &self.frame_index {
-                    if let (Some(a), Some(b)) =
-                        (frame_at_offset(fi, start), frame_at_offset(fi, end))
-                    {
-                        let (lo, hi) = (a.min(b), a.max(b));
-                        start = fi.frames[lo].offset;
-                        end = fi.frames[hi].offset + fi.frames[hi].length.saturating_sub(1);
-                        return Some((start, end));
+        match kind {
+            VisualKind::Char => {
+                Some((start, end))
+            }
+            VisualKind::Line => {
+                if self.buffer.is_empty() {
+                    return Some((start, end));
+                }
+                // 行选模式：起止吸附到行边界（帧模式按帧边界，否则按 16 字节行）
+                if self.is_frame_mode() {
+                    if let Some(fi) = &self.frame_index {
+                        if let (Some(a), Some(b)) =
+                            (frame_at_offset(fi, start), frame_at_offset(fi, end))
+                        {
+                            let (lo, hi) = (a.min(b), a.max(b));
+                            start = fi.frames[lo].offset;
+                            end = fi.frames[hi].offset + fi.frames[hi].length.saturating_sub(1);
+                            return Some((start, end));
+                        }
                     }
                 }
+                start = start / 16 * 16;
+                end = ((end / 16 + 1) * 16 - 1).min(self.buffer.len().saturating_sub(1));
+                Some((start, end))
             }
-            start = start / 16 * 16;
-            end = ((end / 16 + 1) * 16 - 1).min(self.buffer.len().saturating_sub(1));
+            VisualKind::Block => {
+                // 块选模式：返回包围盒（min_row*16+min_col 到 max_row*16+max_col）
+                if let Some((min_row, max_row, min_col, max_col)) = self.block_rect() {
+                    let buf_end = self.buffer.len().saturating_sub(1);
+                    let s = min_row * 16 + min_col;
+                    let e = (max_row * 16 + max_col).min(buf_end);
+                    Some((s, e))
+                } else {
+                    None
+                }
+            }
         }
-        Some((start, end))
+    }
+
+    /// 返回选区的逐段列表（Block 模式下为逐行片段；Char/Line 退化为单段）
+    pub fn selection_segments(&self) -> Vec<(usize, usize)> {
+        let kind = match self.visual_kind {
+            Some(k) => k,
+            None => return vec![],
+        };
+        match kind {
+            VisualKind::Char | VisualKind::Line => {
+                self.selection_range().map(|r| vec![r]).unwrap_or_default()
+            }
+            VisualKind::Block => {
+                let (min_row, max_row, min_col, max_col) = match self.block_rect() {
+                    Some(r) => r,
+                    None => return vec![],
+                };
+                if self.is_frame_mode() {
+                    // 帧模式：row = 帧序号，col = 帧内偏移
+                    let fi = match &self.frame_index {
+                        Some(fi) => fi,
+                        None => return vec![],
+                    };
+                    (min_row..=max_row)
+                        .filter_map(|row| {
+                            let frame = fi.frames.get(row)?;
+                            let s = frame.offset + min_col;
+                            let e = (frame.offset + max_col).min(frame.offset + frame.length.saturating_sub(1));
+                            if s > e { None } else { Some((s, e)) }
+                        })
+                        .collect()
+                } else {
+                    // 标准视图：row = offset/16，col = offset%16
+                    let buf_end = self.buffer.len().saturating_sub(1);
+                    (min_row..=max_row)
+                        .filter_map(|row| {
+                            let s = row * 16 + min_col;
+                            let e = (row * 16 + max_col).min(buf_end);
+                            if s > e { None } else { Some((s, e)) }
+                        })
+                        .collect()
+                }
+            }
+        }
+    }
+
+    /// 块选区的行列范围：`(min_row, max_row, min_col, max_col)` 供渲染层 O(1) 判定。
+    /// 标准视图 row=offset/16, col=offset%16；帧模式 row=帧序号, col=帧内偏移。
+    pub fn block_rect(&self) -> Option<(usize, usize, usize, usize)> {
+        if self.visual_kind != Some(VisualKind::Block) {
+            return None;
+        }
+        let anchor = self.visual_anchor?;
+        let col_anchor = self.block_col_anchor?;
+        if self.is_frame_mode() {
+            let fi = self.frame_index.as_ref()?;
+            let anchor_frame = frame_at_offset(fi, anchor)?;
+            let cursor_frame = frame_at_offset(fi, self.cursor_offset)?;
+            let cursor_col = self.cursor_offset - fi.frames[cursor_frame].offset;
+            let min_row = anchor_frame.min(cursor_frame);
+            let max_row = anchor_frame.max(cursor_frame);
+            let min_col = col_anchor.min(cursor_col);
+            let max_col = col_anchor.max(cursor_col);
+            Some((min_row, max_row, min_col, max_col))
+        } else {
+            let anchor_row = anchor / 16;
+            let cursor_row = self.cursor_offset / 16;
+            let cursor_col = self.cursor_offset % 16;
+            let min_row = anchor_row.min(cursor_row);
+            let max_row = anchor_row.max(cursor_row);
+            let min_col = col_anchor.min(cursor_col);
+            let max_col = col_anchor.max(cursor_col);
+            Some((min_row, max_row, min_col, max_col))
+        }
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {

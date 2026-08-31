@@ -55,6 +55,7 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
 
     // Visual 选区（与 hex_view 一致，选区内字节高亮）
     let visual_range = app.selection_range();
+    let block_rect = app.block_rect();
 
     let data_width = inner.width.saturating_sub(header_width);
     let visible_bytes = (data_width as usize) / 3;
@@ -147,9 +148,15 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
                     let is_cursor_byte = app.cursor_offset == byte_offset;
                     let is_search_match = app.search_state.is_match_byte(byte_offset);
                     let is_current_match = app.search_state.is_current_match_byte(byte_offset);
-                    let is_visual_selected = visual_range
-                        .map(|(s, e)| byte_offset >= s && byte_offset <= e)
-                        .unwrap_or(false);
+                    let is_visual_selected = if let Some((min_row, max_row, min_col, max_col)) = block_rect {
+                        // Block 模式：row = 帧序号，col = 帧内偏移
+                        let col = byte_offset.saturating_sub(frame.offset);
+                        frame_idx >= min_row && frame_idx <= max_row && col >= min_col && col <= max_col
+                    } else {
+                        visual_range
+                            .map(|(s, e)| byte_offset >= s && byte_offset <= e)
+                            .unwrap_or(false)
+                    };
 
                     let (fg, bg) = if is_cursor_byte {
                         (Color::Black, Some(Color::White))
@@ -201,6 +208,7 @@ mod tests {
 
     use crate::buffer::Buffer;
     use crate::frame::{FrameConfig, ViewMode, build_frame_index};
+    use crate::app::VisualKind;
 
     /// 回归测试（Task #22）：frame 视图下 Visual 选中字节应以选区背景色高亮（与 hex_view 一致）
     #[test]
@@ -215,6 +223,7 @@ mod tests {
         app.view_mode = ViewMode::Frame;
         // 选中字节 2..=5（光标在 5）
         app.visual_anchor = Some(2);
+        app.visual_kind = Some(VisualKind::Char);
         app.cursor_offset = 5;
 
         let backend = TestBackend::new(80, 12);

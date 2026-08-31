@@ -157,6 +157,59 @@ impl Buffer {
         self.dirty = true;
     }
 
+    /// 批量插入多段字节（一次遍历完成，避免逐段插入的 O(n²) 开销）。
+    /// `inserts` 为 (offset, bytes) 列表，内部按 offset 升序应用，
+    /// 相同 offset 的多段按传入顺序依次拼接。
+    pub fn insert_bytes_batch(&mut self, inserts: &[(usize, &[u8])]) {
+        if inserts.is_empty() {
+            return;
+        }
+        let mut sorted: Vec<(usize, &[u8])> = inserts.to_vec();
+        sorted.sort_by_key(|&(off, _)| off);
+        let old_len = self.data.len();
+        let total: usize = sorted.iter().map(|(_, b)| b.len()).sum();
+
+        // 一次遍历构造新数据（分段拷贝 + 插入点拼接）
+        let mut new_data = Vec::with_capacity(old_len + total);
+        let mut prev = 0usize;
+        for k in 0..=sorted.len() {
+            if k == sorted.len() {
+                new_data.extend_from_slice(&self.data[prev..]);
+                break;
+            }
+            let off = sorted[k].0.min(old_len);
+            new_data.extend_from_slice(&self.data[prev..off]);
+            new_data.extend_from_slice(sorted[k].1);
+            prev = off;
+        }
+        self.data = new_data;
+
+        // 一次遍历重映射 modified 索引（双指针，避免逐段重建集合）
+        let mut sorted_idx: Vec<usize> = self.modified.iter().copied().collect();
+        sorted_idx.sort_unstable();
+        let mut new_modified = HashSet::with_capacity(sorted_idx.len() + total);
+        let mut k = 0usize;
+        let mut shift = 0usize;
+        for idx in sorted_idx {
+            while k < sorted.len() && sorted[k].0.min(old_len) <= idx {
+                shift += sorted[k].1.len();
+                k += 1;
+            }
+            new_modified.insert(idx + shift);
+        }
+        // 标记新插入的字节为 modified（新坐标 = 原坐标 + 之前各段长度之和）
+        let mut acc_shift = 0usize;
+        for &(off, bytes) in &sorted {
+            let base = off.min(old_len) + acc_shift;
+            for i in 0..bytes.len() {
+                new_modified.insert(base + i);
+            }
+            acc_shift += bytes.len();
+        }
+        self.modified = new_modified;
+        self.dirty = true;
+    }
+
     pub fn remove_range(&mut self, offset: usize, len: usize) -> Vec<u8> {
         let end = (offset + len).min(self.data.len());
         let actual_len = end - offset;
@@ -175,6 +228,70 @@ impl Buffer {
         self.modified = new_modified;
         self.dirty = true;
         removed
+    }
+
+    /// 批量删除多段字节（一次遍历完成，避免逐段删除的 O(n²) 开销）。
+    /// 各段的 (offset, len) 均以**当前数据坐标**为准，内部按 offset 升序应用。
+    pub fn remove_ranges_batch(&mut self, ranges: &[(usize, usize)]) {
+        if ranges.is_empty() {
+            return;
+        }
+        let old_len = self.data.len();
+        // 钳制到缓冲区内并过滤空段（排序后合并重叠段，避免越界）
+        let mut sorted: Vec<(usize, usize)> = ranges.to_vec();
+        sorted.sort_by_key(|&(off, _)| off);
+        let mut clipped: Vec<(usize, usize)> = Vec::new();
+        for (off, len) in sorted {
+            let off = off.min(old_len);
+            let len = len.min(old_len - off);
+            if len == 0 {
+                continue;
+            }
+            if let Some(last) = clipped.last_mut() {
+                let (lo, ll) = *last;
+                if off <= lo + ll {
+                    // 与上一段重叠/相邻：扩展上一段覆盖（与逐段删除略有差异，
+                    // 仅作为重叠输入的兼容处理；调用方应保证各段不重叠）
+                    let end = (off + len).max(lo + ll);
+                    *last = (lo, end - lo);
+                    continue;
+                }
+            }
+            clipped.push((off, len));
+        }
+        if clipped.is_empty() {
+            return;
+        }
+
+        // 一次遍历构造新数据（跳过被删段）
+        let total: usize = clipped.iter().map(|&(_, l)| l).sum();
+        let mut new_data = Vec::with_capacity(old_len.saturating_sub(total));
+        let mut prev = 0usize;
+        for &(off, len) in &clipped {
+            new_data.extend_from_slice(&self.data[prev..off]);
+            prev = off + len;
+        }
+        new_data.extend_from_slice(&self.data[prev..]);
+        self.data = new_data;
+
+        // 一次遍历重映射 modified 索引（落在被删段内的丢弃，其后的左移）
+        let mut sorted_idx: Vec<usize> = self.modified.iter().copied().collect();
+        sorted_idx.sort_unstable();
+        let mut new_modified = HashSet::with_capacity(sorted_idx.len());
+        let mut k = 0usize;
+        let mut shift = 0usize;
+        for idx in sorted_idx {
+            while k < clipped.len() && clipped[k].0 + clipped[k].1 <= idx {
+                shift += clipped[k].1;
+                k += 1;
+            }
+            if k < clipped.len() && idx >= clipped[k].0 {
+                continue; // 落在被删段内，丢弃（k 未前进，后续索引继续对比本段）
+            }
+            new_modified.insert(idx - shift);
+        }
+        self.modified = new_modified;
+        self.dirty = true;
     }
 
     pub fn is_modified(&self, offset: usize) -> bool {

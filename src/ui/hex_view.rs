@@ -17,6 +17,7 @@ pub fn draw(
     scroll_offset: usize,
     search_state: &SearchState,
     visual_range: Option<(usize, usize)>,
+    block_rect: Option<(usize, usize, usize, usize)>,
 ) {
     let block = Block::default()
         .title(" Hex View ")
@@ -91,9 +92,15 @@ pub fn draw(
 
                 let is_search_match = search_state.is_match_byte(offset);
                 let is_current_match = search_state.is_current_match_byte(offset);
-                let is_visual_selected = visual_range
-                    .map(|(s, e)| offset >= s && offset <= e)
-                    .unwrap_or(false);
+                let is_visual_selected = if let Some((min_row, max_row, min_col, max_col)) = block_rect {
+                    let row = offset / 16;
+                    let col = offset % 16;
+                    row >= min_row && row <= max_row && col >= min_col && col <= max_col
+                } else {
+                    visual_range
+                        .map(|(s, e)| offset >= s && offset <= e)
+                        .unwrap_or(false)
+                };
 
                 let (hex_fg, hex_bg) = if is_cursor_byte && active_panel == Panel::Hex {
                     (Color::Black, Some(Color::White))

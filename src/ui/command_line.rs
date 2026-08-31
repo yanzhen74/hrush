@@ -4,7 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, VisualKind};
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     match app.mode {
@@ -57,6 +57,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                     Span::raw(":Matches  "),
                     Span::styled("Ctrl+W", Style::default().fg(Color::Yellow)),
                     Span::raw(":Panel  "),
+                    Span::styled("Ctrl+P", Style::default().fg(Color::Yellow)),
+                    Span::raw(":OverPaste  "),
                     Span::styled("Ctrl+O/Tab", Style::default().fg(Color::Yellow)),
                     Span::raw(":Back/Fwd"),
                 ]);
@@ -96,6 +98,23 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
             if let Some((msg, _)) = &app.message {
                 let line = Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)));
                 let paragraph = Paragraph::new(line);
+                frame.render_widget(paragraph, area);
+            } else if app.visual_kind == Some(VisualKind::Block) {
+                let help = Line::from(vec![
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Cancel  "),
+                    Span::styled("y", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Yank  "),
+                    Span::styled("d", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Delete  "),
+                    Span::styled("i", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Insert  "),
+                    Span::styled("a", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Append  "),
+                    Span::styled("p", Style::default().fg(Color::Yellow)),
+                    Span::raw(":Paste"),
+                ]);
+                let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
                 frame.render_widget(paragraph, area);
             } else {
                 let help = Line::from(vec![

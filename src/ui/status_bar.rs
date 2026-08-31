@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, VisualKind};
 use crate::frame::FrameConfig;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
@@ -14,7 +14,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Replace => (" REPLACE ", Color::Red),
         Mode::Command => (" COMMAND ", Color::Yellow),
         Mode::Search => (" SEARCH ", Color::Magenta),
-        Mode::Visual if app.visual_line => (" VISUAL LINE ", Color::Magenta),
+        Mode::Visual if app.visual_kind == Some(VisualKind::Block) => (" VISUAL BLOCK ", Color::Magenta),
+        Mode::Visual if app.visual_kind == Some(VisualKind::Line) => (" VISUAL LINE ", Color::Magenta),
         Mode::Visual => (" VISUAL ", Color::Magenta),
         Mode::Help => (" HELP ", Color::Cyan),
     };

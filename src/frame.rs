@@ -53,6 +53,86 @@ pub fn rebuild_frame_index(frame_index: &mut FrameIndex, data: &[u8]) {
     };
 }
 
+/// 批量插入后增量调整帧索引（块操作专用，避免按配置重切导致帧边界错位）：
+/// 插入点所在帧长度增长，其后各帧 offset 右移。
+/// `inserts` 为 (offset, len)，offset 以**插入前**数据坐标为准，各段互不重叠。
+/// 插入点恰在帧尾时归属该帧（视为追加到帧末）。
+pub fn adjust_for_inserts(fi: &mut FrameIndex, inserts: &[(usize, usize)]) {
+    if inserts.is_empty() || fi.frames.is_empty() {
+        return;
+    }
+    let mut sorted: Vec<(usize, usize)> = inserts.to_vec();
+    sorted.sort_by_key(|&(off, _)| off);
+    // 单遍扫描：帧与插入点均升序，累计 shift 一次完成 offset 平移与帧长增长，
+    // 避免逐插入点 O(帧数) 查找/平移造成的 O(帧数²) 假死
+    let mut new_frames: Vec<Frame> = Vec::with_capacity(fi.frames.len());
+    let mut it = sorted.iter().peekable();
+    let mut shift = 0usize;
+    for fr in &fi.frames {
+        let mut extra = 0usize;
+        while let Some(&(off, len)) = it.peek().copied() {
+            // 插入前坐标中 off <= 帧尾即归属本帧（帧尾插入视为追加到帧末）
+            if off <= fr.offset + fr.length {
+                extra += len;
+                it.next();
+            } else {
+                break;
+            }
+        }
+        new_frames.push(Frame {
+            offset: fr.offset + shift,
+            length: fr.length + extra,
+        });
+        shift += extra;
+    }
+    // 超出末帧尾的插入点（理论上已被钳制）兜底追加到末帧
+    let mut tail = 0usize;
+    for &(off, len) in it {
+        let _ = off;
+        tail += len;
+    }
+    if tail > 0 {
+        if let Some(last) = new_frames.last_mut() {
+            last.length += tail;
+        }
+    }
+    fi.frames = new_frames;
+}
+
+/// 批量删除后增量调整帧索引（块操作专用）：
+/// 删除段所在帧长度收缩，其后各帧 offset 左移。
+/// `ranges` 为 (offset, len)，offset 以**删除前**数据坐标为准，各段互不重叠且位于单帧内。
+pub fn adjust_for_removals(fi: &mut FrameIndex, ranges: &[(usize, usize)]) {
+    if ranges.is_empty() || fi.frames.is_empty() {
+        return;
+    }
+    let mut sorted: Vec<(usize, usize)> = ranges.to_vec();
+    sorted.sort_by_key(|&(off, _)| off);
+    // 单遍扫描：帧与删除段均升序（删除前坐标），累计 shift 一次完成 offset 平移与帧长收缩
+    let mut new_frames: Vec<Frame> = Vec::with_capacity(fi.frames.len());
+    let mut it = sorted.iter().peekable();
+    let mut shift = 0usize;
+    for fr in &fi.frames {
+        let mut take = 0usize;
+        while let Some(&(off, len)) = it.peek().copied() {
+            if off < fr.offset + fr.length {
+                // 钳制到本帧剩余长度内（调用方应保证各段不重叠且位于单帧内）
+                let avail = fr.offset + fr.length - off - take;
+                take += len.min(avail);
+                it.next();
+            } else {
+                break;
+            }
+        }
+        new_frames.push(Frame {
+            offset: fr.offset.saturating_sub(shift),
+            length: fr.length.saturating_sub(take),
+        });
+        shift += take;
+    }
+    fi.frames = new_frames;
+}
+
 /// 根据 buffer 偏移量找到所在帧的索引号
 pub fn frame_at_offset(frame_index: &FrameIndex, offset: usize) -> Option<usize> {
     for (idx, frame) in frame_index.frames.iter().enumerate() {

@@ -45,6 +45,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             app.scroll_offset,
             &app.search_state,
             app.selection_range(),
+            app.block_rect(),
         );
     }
 
