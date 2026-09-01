@@ -91,7 +91,12 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         "export" => {
             if parts.len() >= 2 {
                 let path = parts[1];
-                import::export_hex_file(app.buffer.get_range(0, app.buffer.len()), Path::new(path))?;
+                // 大文件模式下整份补丁合并导出代价高，未保存时提示先写盘（就地补丁写）
+                if app.buffer.is_large() && app.buffer.is_dirty() {
+                    bail!("Large-file mode: please :w before :export");
+                }
+                let data = app.buffer.get_range(0, app.buffer.len());
+                import::export_hex_file(&data, Path::new(path))?;
                 app.message = Some((format!("Exported to {}", path), Instant::now()));
             } else {
                 app.message = Some(("Usage: :export <path>".to_string(), Instant::now()));
@@ -426,20 +431,21 @@ fn checksum_bytes<'a>(
         for &(start, end) in segments {
             if end >= start && start < app.buffer.len() {
                 let len = (end - start + 1).min(app.buffer.len() - start);
-                data.extend_from_slice(app.buffer.get_range(start, len));
+                data.extend_from_slice(&app.buffer.get_range(start, len));
             }
         }
         Cow::Owned(data)
     } else {
-        Cow::Borrowed(checksum_data(app, checksum_range(app, pending_range)))
+        checksum_data(app, checksum_range(app, pending_range))
     }
 }
 
-/// 按范围取字节切片（含两端），越界由 get_range 钳制，空缓冲区返回空切片
-fn checksum_data(app: &App, range: (usize, usize)) -> &[u8] {
+/// 按范围取字节切片（含两端），越界由 get_range 钳制，空缓冲区返回空切片；
+/// 大文件模式与覆写层相交时返回补丁后副本（Cow::Owned）
+fn checksum_data(app: &App, range: (usize, usize)) -> Cow<'_, [u8]> {
     let (start, end) = range;
     if app.buffer.is_empty() || end < start {
-        return &[];
+        return Cow::Borrowed(&[]);
     }
     app.buffer.get_range(start, end - start + 1)
 }
@@ -736,8 +742,9 @@ fn execute_substitute(app: &mut App, global: bool, old: &str, new: &str) -> Resu
         });
 
         if need_search {
-            // 零拷贝共享数据快照（搜索期间若发生编辑，Buffer 写时分离，快照不受影响）
-            let data = app.buffer.shared_data();
+            // 零拷贝共享数据快照（搜索期间若发生编辑，Buffer 写时分离，快照不受影响；
+            // 大文件模式携带覆写层，搜索可见已编辑内容）
+            let data = app.buffer.search_snapshot();
             app.search_state.start_search(data, old_pat.clone());
             // 对于替换操作，需要等待搜索完成后才能替换
             // 等待异步搜索完成（最多等待 5 秒）
@@ -1123,13 +1130,13 @@ mod tests {
         // undo 会把光标移回编辑起点，需恢复光标以保持原选区宽度
         app.cursor_offset = 5;
         execute_command(&mut app, "fill 255").unwrap();
-        assert_eq!(app.buffer.get_range(2, 4), &[0xFF; 4]);
+        assert_eq!(&app.buffer.get_range(2, 4)[..], &[0xFF; 4]);
 
         // pending_range 优先：无活动选区时按暂存范围填充
         let mut app = app_with_data(&[0u8; 8]);
         app.pending_range = Some((6, 7));
         execute_command(&mut app, "fill 0x11").unwrap();
-        assert_eq!(app.buffer.get_range(6, 2), &[0x11, 0x11]);
+        assert_eq!(&app.buffer.get_range(6, 2)[..], &[0x11, 0x11]);
     }
 
     /// `:set` 循环覆盖选区（选区长 5 → AA BB AA BB AA）；支持空格分隔；单个可撤销编辑；
@@ -1154,10 +1161,10 @@ mod tests {
         // undo 会把光标移回编辑起点，需恢复光标以保持原选区宽度
         app.cursor_offset = 5;
         execute_command(&mut app, "set AA BB").unwrap();
-        assert_eq!(app.buffer.get_range(1, 5), &[0xAA, 0xBB, 0xAA, 0xBB, 0xAA]);
+        assert_eq!(&app.buffer.get_range(1, 5)[..], &[0xAA, 0xBB, 0xAA, 0xBB, 0xAA]);
         execute_command(&mut app, "set AABBCCDDEE11").unwrap();
-        assert_eq!(app.buffer.get_range(1, 5), &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
-        assert_eq!(app.buffer.get_range(6, 2), &[0, 0], "选区外字节不应被修改");
+        assert_eq!(&app.buffer.get_range(1, 5)[..], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        assert_eq!(&app.buffer.get_range(6, 2)[..], &[0, 0], "选区外字节不应被修改");
     }
 
     /// 无选区时 `:fill` / `:set` 报错；非法值（>0xFF / 非法字符 / 奇数位）报错不修改数据；
@@ -1190,7 +1197,7 @@ mod tests {
         // 报错后命令仍可正常使用（无残留状态）
         app.pending_range = Some((0, 1));
         execute_command(&mut app, "fill 0x5A").unwrap();
-        assert_eq!(app.buffer.get_range(0, 2), &[0x5A, 0x5A]);
+        assert_eq!(&app.buffer.get_range(0, 2)[..], &[0x5A, 0x5A]);
     }
 
     // -----------------------------------------------------------------------
@@ -1234,9 +1241,9 @@ mod tests {
         app.cursor_offset = 2;
         execute_command(&mut app, "overpaste").unwrap();
         assert_eq!(app.buffer.len(), 16, "覆盖粘贴不增长文件");
-        assert_eq!(app.buffer.get_range(2, 3), &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(&app.buffer.get_range(2, 3)[..], &[0xAA, 0xBB, 0xCC]);
         crate::editor::undo(&mut app);
-        assert_eq!(app.buffer.get_range(2, 3), &[0, 0, 0], "一次 u 应还原");
+        assert_eq!(&app.buffer.get_range(2, 3)[..], &[0, 0, 0], "一次 u 应还原");
     }
 
     /// `:overpaste` EOF 截断：yank 超出文件尾只覆盖到 EOF
@@ -1247,7 +1254,7 @@ mod tests {
         app.cursor_offset = 2;
         execute_command(&mut app, "op").unwrap();
         assert_eq!(app.buffer.len(), 4);
-        assert_eq!(app.buffer.get_range(2, 2), &[1, 2]);
+        assert_eq!(&app.buffer.get_range(2, 2)[..], &[1, 2]);
     }
 
     /// `:overpaste` Block yank：自光标行/列逐行覆盖
@@ -1258,8 +1265,8 @@ mod tests {
         app.cursor_offset = 17; // row 1, col 1
         execute_command(&mut app, "overpaste").unwrap();
         assert_eq!(app.buffer.len(), 48);
-        assert_eq!(app.buffer.get_range(17, 2), &[0x11, 0x12]);
-        assert_eq!(app.buffer.get_range(33, 1), &[0x21]);
+        assert_eq!(&app.buffer.get_range(17, 2)[..], &[0x11, 0x12]);
+        assert_eq!(&app.buffer.get_range(33, 1)[..], &[0x21]);
     }
 
     /// `:overpaste` 空 yank：提示 Nothing yanked 且不改缓冲
@@ -1268,6 +1275,6 @@ mod tests {
         let mut app = app_with_data(&[7u8; 8]);
         execute_command(&mut app, "overpaste").unwrap();
         assert!(app.message.is_some(), "应提示 Nothing yanked");
-        assert_eq!(app.buffer.get_range(0, 8), &[7u8; 8]);
+        assert_eq!(&app.buffer.get_range(0, 8)[..], &[7u8; 8]);
     }
 }

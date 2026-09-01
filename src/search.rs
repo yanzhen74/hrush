@@ -1,9 +1,11 @@
 use anyhow::{Result, bail};
 use memchr::{memchr, memmem};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 
 use crate::app::App;
+use crate::buffer::DataSnapshot;
 use crate::editor;
 
 #[derive(Clone, Debug)]
@@ -77,12 +79,12 @@ impl SearchState {
         }
     }
 
-    /// 启动后台线程搜索（data 由调用方通过 Buffer::shared_data 零拷贝共享）
-    pub fn start_search(&mut self, data: Arc<Vec<u8>>, pattern: SearchPattern) {
+    /// 启动后台线程搜索（data 由调用方通过 Buffer::search_snapshot 零拷贝构造）
+    pub fn start_search(&mut self, data: DataSnapshot, pattern: SearchPattern) {
         self.clear();
 
         let pat_len = pattern.len();
-        if pat_len == 0 || pat_len > data.len() {
+        if pat_len == 0 || pat_len > data.base().len() {
             self.pattern = Some(pattern);
             return;
         }
@@ -90,8 +92,8 @@ impl SearchState {
         self.pattern = Some(pattern.clone());
 
         // 进度总量：所有可能的匹配起始位置数（由 find_all_matches 内部维护实际扫描进度）
-        let total = if data.len() >= pat_len {
-            data.len() - pat_len + 1
+        let total = if data.base().len() >= pat_len {
+            data.base().len() - pat_len + 1
         } else {
             0
         };
@@ -112,7 +114,18 @@ impl SearchState {
         let pat = pattern.pattern();
 
         let handle = thread::spawn(move || {
-            find_all_matches(data.as_slice(), &pat, Some(&cancel_flag), Some(&progress))
+            match &data {
+                DataSnapshot::Mem(_) => {
+                    find_all_matches(data.base(), &pat, Some(&cancel_flag), Some(&progress))
+                }
+                DataSnapshot::Mapped { mmap, overlay } => find_all_matches_overlaid(
+                    &mmap[..],
+                    overlay,
+                    &pat,
+                    Some(&cancel_flag),
+                    Some(&progress),
+                ),
+            }
         });
 
         self.search_handle = Some(handle);
@@ -267,6 +280,10 @@ pub fn replace_current(app: &mut App, new_bytes: &[u8]) -> Result<()> {
 
     let new_len = new_bytes.len();
 
+    if !app.buffer.can_resize() && new_len != old_len {
+        bail!("Large-file mode: replacement must have the same length as the pattern");
+    }
+
     app.undo_manager.begin_group("replace current");
 
     if new_len == old_len {
@@ -306,8 +323,13 @@ pub fn replace_all(app: &mut App, old: &SearchPattern, new_bytes: &[u8]) -> Resu
     let buf_len = app.buffer.len();
     let pat = old.pattern();
 
+    if !app.buffer.can_resize() && new_bytes.len() != old_len {
+        bail!("Large-file mode: replacement must have the same length as the pattern");
+    }
+
     if old_len <= buf_len {
-        matches = find_all_matches(app.buffer.data(), &pat, None, None);
+        // 覆写感知（大文件模式看到已编辑内容），内存模式等价于原扫描
+        matches = app.buffer.find_pattern_matches(&pat);
     }
 
     if matches.is_empty() {
@@ -501,6 +523,110 @@ pub fn matches_at(data: &[u8], offset: usize, pat: &[Option<u8>]) -> bool {
     true
 }
 
+/// 覆写感知扫描（大文件模式）：结果与在补丁后数据上做朴素扫描完全一致（含重叠语义）。
+///
+/// 策略：基座先走 SIMD 快扫，再将落在“脏区扩展带”内的匹配剔除重算。
+/// 一个匹配起始位置 s 会覆盖脏偏移 off 当且仅当 s ∈ [off-(pat_len-1), off]，
+/// 将这些候选区间合并为不重叠的带，带内逐位置用覆写层补全字节重新验证，
+/// 最后与带外的基座匹配有序合并。
+pub fn find_all_matches_overlaid(
+    base: &[u8],
+    overlay: &BTreeMap<usize, u8>,
+    pat: &[Option<u8>],
+    cancel_flag: Option<&AtomicBool>,
+    progress: Option<&Mutex<SearchProgress>>,
+) -> Vec<usize> {
+    let pat_len = pat.len();
+    if overlay.is_empty() || pat_len == 0 || base.len() < pat_len {
+        return find_all_matches(base, pat, cancel_flag, progress);
+    }
+    let max_start = base.len() - pat_len;
+
+    // 脏区扩展带：[lo, hi) 形式的候选起始位置区间（BTreeMap 有序，合并后仍有序）
+    let mut bands: Vec<(usize, usize)> = Vec::new();
+    for &off in overlay.keys() {
+        let lo = off.saturating_sub(pat_len - 1);
+        let hi = (off + 1).min(max_start + 1);
+        if lo >= hi {
+            continue;
+        }
+        if let Some(last) = bands.last_mut() {
+            if lo <= last.1 {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        bands.push((lo, hi));
+    }
+
+    // 基座 SIMD 扫描（进度/取消由它上报）
+    let base_matches = find_all_matches(base, pat, cancel_flag, progress);
+    if cancel_flag.map_or(false, |f| f.load(Ordering::SeqCst)) {
+        return base_matches; // 已取消，部分结果直接丢弃于上层清理
+    }
+
+    // 带内逐位置覆写感知重扫（带通常极小，成本可忽）
+    let mut band_matches = Vec::new();
+    for &(lo, hi) in &bands {
+        for s in lo..hi {
+            if matches_overlaid(base, overlay, s, pat) {
+                band_matches.push(s);
+            }
+        }
+    }
+
+    // 合并：基座匹配剔除落在带内的，与带内结果有序归并（两序列均升序）
+    let mut result = Vec::with_capacity(base_matches.len());
+    let mut bi = 0usize;
+    for &m in &base_matches {
+        while bi < bands.len() && bands[bi].1 <= m {
+            bi += 1;
+        }
+        if bi < bands.len() && m >= bands[bi].0 {
+            continue; // 落在带内，用带内重扫结果代替（避免重复）
+        }
+        result.push(m);
+    }
+    let mut merged = Vec::with_capacity(result.len() + band_matches.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < result.len() && j < band_matches.len() {
+        if result[i] <= band_matches[j] {
+            merged.push(result[i]);
+            i += 1;
+        } else {
+            merged.push(band_matches[j]);
+            j += 1;
+        }
+    }
+    merged.extend_from_slice(&result[i..]);
+    merged.extend_from_slice(&band_matches[j..]);
+
+    if let Some(p) = progress {
+        let mut p = p.lock().unwrap();
+        p.matches_found = merged.len();
+    }
+    merged
+}
+
+/// 覆写感知单点匹配：逐字节先查覆写层，未命中再取基座字节。
+/// 调用方需保证 offset + pat.len() <= base.len()。
+fn matches_overlaid(
+    base: &[u8],
+    overlay: &BTreeMap<usize, u8>,
+    offset: usize,
+    pat: &[Option<u8>],
+) -> bool {
+    for j in 0..pat.len() {
+        if let Some(b) = pat[j] {
+            let actual = overlay.get(&(offset + j)).copied().unwrap_or(base[offset + j]);
+            if actual != b {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// 解析搜索/替换文本
 /// 以 `x:` 开头为 hex 模式（如 `x:AABB`），否则为 ASCII；
 /// hex 模式中 `??` 为通配字节（如 `x:AA??BB`）
@@ -549,7 +675,7 @@ mod tests {
     /// 同步执行一次搜索并返回匹配位置（内部仍走异步线程 + poll）
     fn run_search(data: Vec<u8>, pattern: SearchPattern) -> Vec<usize> {
         let mut state = SearchState::new();
-        state.start_search(Arc::new(data), pattern);
+        state.start_search(DataSnapshot::Mem(Arc::new(data)), pattern);
         while !state.poll_result() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -673,7 +799,10 @@ mod tests {
         // 优化前（to_vec 快照）约为两份。
         let data = vec![0xABu8; 256 * 1024 * 1024];
         let mut state = SearchState::new();
-        state.start_search(Arc::new(data), parse_pattern("x:DEADBEEF").unwrap());
+        state.start_search(
+            DataSnapshot::Mem(Arc::new(data)),
+            parse_pattern("x:DEADBEEF").unwrap(),
+        );
         while !state.poll_result() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -681,6 +810,39 @@ mod tests {
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
         let hwm = status.lines().find(|l| l.starts_with("VmHWM")).unwrap_or("VmHWM: n/a");
         eprintln!("搜索完成后峰值 RSS（{}）", hwm.trim());
+    }
+
+    #[test]
+    fn overlaid_search_matches_naive_on_patched_data() {
+        // 覆写感知扫描必须与在补丁后数据上的朴素扫描结果完全一致（含通配与重叠）
+        let n = 4096usize;
+        let mut base = vec![0xAAu8; n];
+        base[100] = 0x00;
+        base[2000] = 0x00;
+        let mut overlay = BTreeMap::new();
+        overlay.insert(100, 0xAA);   // 撤销一个基座空洞 → 新增匹配
+        overlay.insert(2000, 0xBB);  // 破坏一个潜在匹配 → 减少匹配
+        overlay.insert(3500, 0x00);  // 引入新空洞 → 影响带内多个候选位置
+        let pat = parse_pattern("x:AAAA").unwrap().pattern();
+
+        // 朴素基准：手工应用覆写后逐位置扫描（重叠语义）
+        let patched: Vec<u8> = (0..n)
+            .map(|i| overlay.get(&i).copied().unwrap_or(base[i]))
+            .collect();
+        let mut naive = Vec::new();
+        for i in 0..=n - pat.len() {
+            if matches_at(&patched, i, &pat) {
+                naive.push(i);
+            }
+        }
+
+        let got = find_all_matches_overlaid(&base, &overlay, &pat, None, None);
+        assert_eq!(got, naive);
+
+        // 空覆写层：退化为基座扫描，结果一致
+        let empty = BTreeMap::new();
+        let got_empty = find_all_matches_overlaid(&base, &empty, &pat, None, None);
+        assert_eq!(got_empty, find_all_matches(&base, &pat, None, None));
     }
 
     #[test]

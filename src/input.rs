@@ -205,12 +205,27 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
 
         // 模式切换
         KeyCode::Char('i') => {
+            // 大文件模式提前拦截：避免白进 Insert 模式（输入时仍会被 editor 守卫拦）
+            if !app.buffer.can_resize() {
+                app.message = Some((
+                    "Large-file mode: insert/delete disabled (overwrite only)".to_string(),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
             app.mode = Mode::Insert;
             app.insert_after = false;
             app.nibble_input = None;
             app.change_start = Some(app.cursor_offset);
         }
         KeyCode::Char('a') => {
+            if !app.buffer.can_resize() {
+                app.message = Some((
+                    "Large-file mode: insert/delete disabled (overwrite only)".to_string(),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
             app.mode = Mode::Insert;
             app.insert_after = true;
             app.nibble_input = None;
@@ -618,6 +633,13 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
             app.block_col_anchor = None;
         }
         KeyCode::Char('i') => {
+            if !app.buffer.can_resize() {
+                app.message = Some((
+                    "Large-file mode: insert/delete disabled (overwrite only)".to_string(),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
             if app.visual_kind == Some(VisualKind::Block) {
                 let segs = app.selection_segments();
                 if let Some(&(s, _)) = segs.first() {
@@ -648,6 +670,13 @@ fn handle_visual_mode(app: &mut App, key: KeyEvent) {
             app.block_col_anchor = None;
         }
         KeyCode::Char('a') => {
+            if !app.buffer.can_resize() {
+                app.message = Some((
+                    "Large-file mode: insert/delete disabled (overwrite only)".to_string(),
+                    std::time::Instant::now(),
+                ));
+                return;
+            }
             if app.visual_kind == Some(VisualKind::Block) {
                 let segs = app.selection_segments();
                 if let Some(&(_, e)) = segs.first() {
@@ -772,8 +801,9 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
             app.history_index = None;
             match search::parse_pattern(&input) {
                 Ok(pattern) => {
-                    // 零拷贝共享数据快照（搜索期间若发生编辑，Buffer 写时分离，快照不受影响）
-                    let data = app.buffer.shared_data();
+                    // 零拷贝共享数据快照（搜索期间若发生编辑，Buffer 写时分离，快照不受影响；
+                    // 大文件模式携带覆写层，搜索可见已编辑内容）
+                    let data = app.buffer.search_snapshot();
                     app.search_state.start_search(data, pattern);
                 }
                 Err(e) => {
@@ -2465,7 +2495,7 @@ mod tests {
         // 总共增长 3 字节
         assert_eq!(app.buffer.len(), 51, "块插入后文件应增长 3 字节");
         // 验证行 0 原始 col1 位置已插入 0xAB
-        assert_eq!(app.buffer.get_range(1, 1), &[0xAB], "行 0 插入位置");
+        assert_eq!(&app.buffer.get_range(1, 1)[..], &[0xAB], "行 0 插入位置");
     }
 
     /// 6. `p` 对 Block yank 逐行插入
@@ -2484,7 +2514,7 @@ mod tests {
         // row 1: [0x00, 0xCC, 0xDD, 0x00, ...] (16+2=18 字节) - 但偏移已调整
         assert_eq!(app.buffer.len(), 36, "粘贴 2 行×2 字节后应增长 4 字节");
         // 验证行 0 数据
-        assert_eq!(app.buffer.get_range(0, 4), &[0x00, 0xAA, 0xBB, 0x00]);
+        assert_eq!(&app.buffer.get_range(0, 4)[..], &[0x00, 0xAA, 0xBB, 0x00]);
     }
 
     /// 7. `Ctrl+P` Flat 覆盖（文件大小不变）
@@ -2512,9 +2542,9 @@ mod tests {
         let _ = handle_input(&mut app, ctrl_p());
         assert_eq!(app.buffer.len(), 32, "Ctrl+P Block 不应改变文件大小");
         // 行 0 col2..3 应被覆盖为 [0xAA, 0xBB]
-        assert_eq!(app.buffer.get_range(2, 2), &[0xAA, 0xBB]);
+        assert_eq!(&app.buffer.get_range(2, 2)[..], &[0xAA, 0xBB]);
         // 行 1 col2..3 应被覆盖为 [0xCC, 0xDD]
-        assert_eq!(app.buffer.get_range(18, 2), &[0xCC, 0xDD]);
+        assert_eq!(&app.buffer.get_range(18, 2)[..], &[0xCC, 0xDD]);
     }
 
     /// 9. `Ctrl+V` / `v` / `V` 三模式切换
@@ -2562,11 +2592,11 @@ mod tests {
         assert_eq!(app.pending_segments, None, "命令执行后应清空 pending_segments");
 
         // 验证行 0 col1..2 和行 1 col1..2 被填充
-        assert_eq!(app.buffer.get_range(1, 2), &[0xFF, 0xFF], "行 0 块选区应被填充");
-        assert_eq!(app.buffer.get_range(17, 2), &[0xFF, 0xFF], "行 1 块选区应被填充");
+        assert_eq!(&app.buffer.get_range(1, 2)[..], &[0xFF, 0xFF], "行 0 块选区应被填充");
+        assert_eq!(&app.buffer.get_range(17, 2)[..], &[0xFF, 0xFF], "行 1 块选区应被填充");
         // 选区外字节应保持不变
-        assert_eq!(app.buffer.get_range(0, 1), &[0x00], "行 0 col0 不应被修改");
-        assert_eq!(app.buffer.get_range(3, 1), &[0x00], "行 0 col3 不应被修改");
+        assert_eq!(&app.buffer.get_range(0, 1)[..], &[0x00], "行 0 col0 不应被修改");
+        assert_eq!(&app.buffer.get_range(3, 1)[..], &[0x00], "行 0 col3 不应被修改");
     }
 
     // -----------------------------------------------------------------------
@@ -2844,17 +2874,17 @@ mod tests {
         assert_eq!(app.buffer.len(), 51, "三段各插入 1 字节");
         // 每行 col1 左边缘均应为 0xAB：行 0 键入于 1；
         // 行 1/2 需换算键入位移，落在键入后坐标 18/35
-        assert_eq!(app.buffer.get_range(1, 1), &[0xAB]);
-        assert_eq!(app.buffer.get_range(18, 1), &[0xAB]);
-        assert_eq!(app.buffer.get_range(35, 1), &[0xAB]);
+        assert_eq!(&app.buffer.get_range(1, 1)[..], &[0xAB]);
+        assert_eq!(&app.buffer.get_range(18, 1)[..], &[0xAB]);
+        assert_eq!(&app.buffer.get_range(35, 1)[..], &[0xAB]);
 
         editor::undo(&mut app);
         assert_eq!(app.buffer.data(), &original[..], "一次 u 应完全还原");
         editor::redo(&mut app);
         assert_eq!(app.buffer.len(), 51, "一次 Ctrl+R 应重新插入");
-        assert_eq!(app.buffer.get_range(1, 1), &[0xAB]);
-        assert_eq!(app.buffer.get_range(18, 1), &[0xAB]);
-        assert_eq!(app.buffer.get_range(35, 1), &[0xAB]);
+        assert_eq!(&app.buffer.get_range(1, 1)[..], &[0xAB]);
+        assert_eq!(&app.buffer.get_range(18, 1)[..], &[0xAB]);
+        assert_eq!(&app.buffer.get_range(35, 1)[..], &[0xAB]);
     }
 
     /// 块追加会话（a）回归: 其余行应插在选中列右侧（换算键入位移），不得左偏一列
@@ -2869,11 +2899,11 @@ mod tests {
         assert_eq!(app.buffer.len(), 51, "三段各插入 1 字节");
         // 行 0 键入于 2（选中列 1 右侧）；行 1/2 的 0xCD 也应在各自选中列右侧：
         // 原始 18/34 → 键入后 19/35 → 最终 19/36
-        assert_eq!(app.buffer.get_range(2, 1), &[0xCD]);
-        assert_eq!(app.buffer.get_range(19, 1), &[0xCD]);
-        assert_eq!(app.buffer.get_range(36, 1), &[0xCD]);
+        assert_eq!(&app.buffer.get_range(2, 1)[..], &[0xCD]);
+        assert_eq!(&app.buffer.get_range(19, 1)[..], &[0xCD]);
+        assert_eq!(&app.buffer.get_range(36, 1)[..], &[0xCD]);
         // 选中列字节应保持原位（行 1 col1 = 原始 17 → 键入后 18）
-        assert_eq!(app.buffer.get_range(18, 1), &[0x00]);
+        assert_eq!(&app.buffer.get_range(18, 1)[..], &[0x00]);
         // 一次 u 整体撤销
         editor::undo(&mut app);
         assert_eq!(app.buffer.len(), 48, "一次 u 应完全还原");
@@ -2956,11 +2986,11 @@ mod tests {
         let _ = handle_input(&mut app, key('p'));
         assert_eq!(app.buffer.len(), 67, "应插入 3 字节");
         // 各行原 col3 位置应为插入字节，行内其余字节右移收拢到本行内不影响他行
-        assert_eq!(app.buffer.get_range(3, 1), &[0xAA], "行 0 插入位置");
-        assert_eq!(app.buffer.get_range(20, 1), &[0xBB], "行 1 插入位置");
-        assert_eq!(app.buffer.get_range(37, 1), &[0xCC], "行 2 插入位置");
-        assert_eq!(app.buffer.get_range(17, 3), &[16, 17, 18], "行 1 前部不受影响");
-        assert_eq!(app.buffer.get_range(51, 3), &[48, 49, 50], "行 3 不受影响");
+        assert_eq!(&app.buffer.get_range(3, 1)[..], &[0xAA], "行 0 插入位置");
+        assert_eq!(&app.buffer.get_range(20, 1)[..], &[0xBB], "行 1 插入位置");
+        assert_eq!(&app.buffer.get_range(37, 1)[..], &[0xCC], "行 2 插入位置");
+        assert_eq!(&app.buffer.get_range(17, 3)[..], &[16, 17, 18], "行 1 前部不受影响");
+        assert_eq!(&app.buffer.get_range(51, 3)[..], &[48, 49, 50], "行 3 不受影响");
         // modified 标记跟随插入点平移（插入前的修改点在插入后仍被正确标记）
         assert!(app.buffer.is_modified(3), "新插入字节应标记 modified");
 
@@ -2968,7 +2998,7 @@ mod tests {
         assert_eq!(app.buffer.data(), &original[..], "一次 u 应完整撤销块粘贴");
         editor::redo(&mut app);
         assert_eq!(app.buffer.len(), 67, "Ctrl+R 应完整重做块粘贴");
-        assert_eq!(app.buffer.get_range(20, 1), &[0xBB], "重做后行 1 插入位置正确");
+        assert_eq!(&app.buffer.get_range(20, 1)[..], &[0xBB], "重做后行 1 插入位置正确");
     }
 
     /// Bug2 性能回归（撤销/重做）: 大文件全文件单列块粘贴后 `u`/`Ctrl+R` 不应假死
@@ -3035,15 +3065,15 @@ mod tests {
 
         let _ = handle_input(&mut app, key('p'));
         assert_eq!(app.buffer.len(), 23, "应插入 3 字节");
-        assert_eq!(app.buffer.get_range(6, 1), &[0xA1], "行 0 应在光标列后插入");
-        assert_eq!(app.buffer.get_range(21, 2), &[0xC3, 0xB2], "越界行应追加到末尾");
+        assert_eq!(&app.buffer.get_range(6, 1)[..], &[0xA1], "行 0 应在光标列后插入");
+        assert_eq!(&app.buffer.get_range(21, 2)[..], &[0xC3, 0xB2], "越界行应追加到末尾");
 
         editor::undo(&mut app);
         assert_eq!(app.buffer.data(), &original[..], "u 应完整还原");
         editor::redo(&mut app);
         assert_eq!(app.buffer.len(), 23, "Ctrl+R 应完整重放");
-        assert_eq!(app.buffer.get_range(6, 1), &[0xA1], "重做后行 0 插入位置正确");
-        assert_eq!(app.buffer.get_range(21, 2), &[0xC3, 0xB2], "重做后越界行顺序正确");
+        assert_eq!(&app.buffer.get_range(6, 1)[..], &[0xA1], "重做后行 0 插入位置正确");
+        assert_eq!(&app.buffer.get_range(21, 2)[..], &[0xC3, 0xB2], "重做后越界行顺序正确");
     }
 
     /// 11. 空 buffer / EOF 铗制不 panic

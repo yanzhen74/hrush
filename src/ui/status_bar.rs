@@ -49,6 +49,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(" [+]", Style::default().fg(Color::Yellow)));
     }
 
+    // 大文件模式指示：只读 + 覆写，不支持插入/删除
+    if app.buffer.is_large() {
+        spans.push(Span::styled(
+            " [LARGE]",
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
     if app.is_searching() {
         let progress = app.search_state.progress.lock().unwrap();
         let pct = if progress.total > 0 {

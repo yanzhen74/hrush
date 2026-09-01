@@ -436,6 +436,14 @@ pub fn run(file: Option<String>, import: Option<String>) -> Result<()> {
         app.buffer = Buffer::from_hex_import(Path::new(&path))?;
     }
 
+    // 大文件模式开机提示（只读 + 覆写，不支持插入/删除）
+    if app.buffer.is_large() {
+        app.message = Some((
+            "Large-file mode: overwrite only (insert/delete disabled), :w patches in place".to_string(),
+            Instant::now(),
+        ));
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;

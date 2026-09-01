@@ -1,6 +1,19 @@
 use crate::app::App;
 use crate::undo::{ActionType, EditAction, UndoGroup};
 
+/// 大文件模式拦截：插入/删除等改变长度的操作不可用，提示用户（覆写不受限）。
+/// 返回 true 表示已拦截，调用方应直接返回。
+fn guard_resize(app: &mut App) -> bool {
+    if app.buffer.can_resize() {
+        return false;
+    }
+    app.message = Some((
+        "Large-file mode: insert/delete disabled (overwrite only)".to_string(),
+        std::time::Instant::now(),
+    ));
+    true
+}
+
 /// 编辑后根据需要重建帧索引。
 /// 常规编辑不再调用本函数（帧模式下改为增量调整，见 adjust_frames_for_*），
 /// 保留作为全量重建入口（如手动重新扫描场景）。
@@ -43,16 +56,22 @@ pub fn set_byte(app: &mut App, offset: usize, value: u8) {
     // 覆盖不改变长度，帧索引无需变动
 }
 
-/// 插入字节，记录 undo
+/// 插入字节，记录 undo（大文件模式拦截）
 pub fn insert_byte(app: &mut App, offset: usize, value: u8) {
+    if guard_resize(app) {
+        return;
+    }
     let action = EditAction::insert_byte(offset, value);
     app.buffer.insert_byte(offset, value);
     app.undo_manager.record(action);
     adjust_frames_for_inserts(app, &[(offset, 1)]);
 }
 
-/// 删除字节，记录 undo
+/// 删除字节，记录 undo（大文件模式拦截）
 pub fn remove_byte(app: &mut App, offset: usize) {
+    if guard_resize(app) {
+        return;
+    }
     if let Some(old) = app.buffer.remove_byte(offset) {
         let action = EditAction::remove_byte(offset, old);
         app.undo_manager.record(action);
@@ -60,8 +79,11 @@ pub fn remove_byte(app: &mut App, offset: usize) {
     }
 }
 
-/// 批量插入字节，记录 undo
+/// 批量插入字节，记录 undo（大文件模式拦截）
 pub fn insert_bytes(app: &mut App, offset: usize, bytes: &[u8]) {
+    if guard_resize(app) {
+        return;
+    }
     let action = EditAction {
         offset,
         old_bytes: vec![],
@@ -76,7 +98,7 @@ pub fn insert_bytes(app: &mut App, offset: usize, bytes: &[u8]) {
 /// 批量插入多段字节（缓冲区一次完成，避免逐段插入的 O(n²) 开销），
 /// 逐段记录 undo（按传入顺序），保持与逐段插入相同的撤销/重做语义
 pub fn insert_bytes_batch(app: &mut App, inserts: &[(usize, Vec<u8>)]) {
-    if inserts.is_empty() {
+    if guard_resize(app) || inserts.is_empty() {
         return;
     }
     let refs: Vec<(usize, &[u8])> = inserts.iter().map(|(o, b)| (*o, b.as_slice())).collect();
@@ -97,6 +119,9 @@ pub fn insert_bytes_batch(app: &mut App, inserts: &[(usize, Vec<u8>)]) {
 
 /// 批量删除字节，记录 undo
 pub fn remove_range(app: &mut App, offset: usize, len: usize) -> Vec<u8> {
+    if guard_resize(app) {
+        return Vec::new();
+    }
     let removed = app.buffer.remove_range(offset, len);
     let removed_len = removed.len();
     let action = EditAction {
@@ -260,7 +285,7 @@ fn try_redo_batch(app: &mut App, group: &UndoGroup) -> bool {
 /// 逐段记录 undo（按传入顺序，通常自高偏移到低偏移），
 /// 保持与逐段删除相同的撤销语义；各段需为当前坐标且互不重叠
 pub fn remove_ranges_batch(app: &mut App, ranges: &[(usize, usize)]) {
-    if ranges.is_empty() {
+    if guard_resize(app) || ranges.is_empty() {
         return;
     }
     // 先在删除前抓取各段内容作为撤销依据（各段互不重叠，顺序无关）

@@ -18,6 +18,7 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry { key: "", description: "Seven modes: Normal, Insert, Replace, Command, Search, Visual, Help" },
             HelpEntry { key: "", description: "Supports hex editing, ASCII editing, frame analysis, search/replace" },
             HelpEntry { key: "", description: "Type inspector decodes bytes at cursor as integers, floats, string, hex" },
+            HelpEntry { key: "", description: "Files >= 256MB open in large-file mode (mmap): overwrite only, no insert/delete; :w patches in place" },
             HelpEntry { key: "", description: "Use :help <topic> to jump to a specific topic" },
         ],
     },
