@@ -7,7 +7,7 @@
 
 ## Features
 
-- **High Performance** — Written in Rust with memory-mapped file support (`mmap`) for large files.
+- **High Performance** — Written in Rust with SIMD-accelerated search (memchr) and memory-mapped large-file mode.
 - **Vi-style Key Bindings** — Familiar `hjkl` navigation and modal editing for power users.
 - **Seven Modes** — Normal / Insert / Replace / Visual / Command / Search / Help.
 - **Dual-panel Editing** — Hex and ASCII views side-by-side with `Ctrl+W` to switch panels.
@@ -24,7 +24,17 @@
 - **Block (Rectangular) Editing** — Yank/cut/paste rectangular blocks; `p` pastes a block row-by-row at the cursor, `Ctrl+P` (or `:overpaste`) overwrites without growing the file. In block mode, `i`/`a` insert/append the typed bytes across every selected row, undone as a single change.
 - **Checksums** — Compute `:sum8/:sum16/:sum32`, `:crc16` (configurable poly/init/refin/refout/xorout), `:crc32`, `:md5`, `:sha256` over the selection or the whole file.
 - **Repeat Last Change** — `.` repeats the last edit (supports count prefix, e.g., `3.`).
+- **Range Extraction** — Save a slice to a new file: Visual selection then `:w out.bin`, or explicit ranges like `:w out.bin 0x1000 0x2000`, `:w out.bin +L256` (from cursor), `:w out.bin 0x2000 +0xA0`, `:w out.bin $` (cursor to EOF). Existing targets are refused unless `:w!` is used, and the message states exactly which part would be written.
 - **Built-in Help System** — Press `?` or `F1` for full-screen help with all keybindings and commands. Use `:help [topic]` to jump to specific topics. Status bar displays the current mode with color-coded indicators.
+
+## Large-File Mode
+
+Files >= 256 MB are opened automatically in large-file mode: the file is memory-mapped read-only instead of being read into memory, and edits are applied through an overlay layer.
+
+- **Overwrite editing** — `r`, `R` and same-length `:s` replacement work normally; search sees edited content.
+- **Insert / delete disabled** — length-changing operations are rejected with a message. This is a deliberate design boundary: at this size the dominant real-world tasks (firmware patching, capture data inspection, dump fixing) are point fixes, and inserting into the middle of a multi-GB file would silently break offsets, alignment and checksums anyway.
+- **`:w` patches in place** — only the modified byte runs are written back (seek + write), never a full rewrite; `:save as` streams the merged view without holding a full copy.
+- **Low memory footprint** — resident pages + overlay, not the whole file. The status bar shows a `[LARGE]` tag in this mode.
 
 ## Screenshot
 

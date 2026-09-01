@@ -102,9 +102,10 @@ pub static HELP_SECTIONS: &[HelpSection] = &[
         id: "commands",
         title: "Commands",
         entries: &[
-            HelpEntry { key: ":w", description: "Save current file" },
-            HelpEntry { key: ":w <path>", description: "Save to a new file path" },
-            HelpEntry { key: ":w!", description: "Force save (ignore warnings)" },
+            HelpEntry { key: ":w", description: "Save current file (refused with warning while a selection is pending)" },
+            HelpEntry { key: ":w <path>", description: "Save whole buffer to a new path; with a pending Visual selection, writes only the selection" },
+            HelpEntry { key: ":w <path> +L200", description: "Extract 200 bytes from cursor (also +200 / +0xA0); <start> +L<len>, <start> <end>, or $ (to EOF) supported" },
+            HelpEntry { key: ":w!", description: "Force save / overwrite existing target (explicit confirmation)" },
             HelpEntry { key: ":q", description: "Quit (fails if unsaved changes)" },
             HelpEntry { key: ":q!", description: "Force quit without saving" },
             HelpEntry { key: ":wq", description: "Save and quit" },

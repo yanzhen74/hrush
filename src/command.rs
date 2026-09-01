@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::app::{App, Mode, VisualKind};
 use crate::buffer::FileSource;
@@ -27,21 +27,15 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
     let command = parts[0];
 
     match command {
-        "w" => {
-            if let Some(msg) = check_frame_length(app) {
-                app.message = Some((msg, Instant::now()));
-                return Ok(());
+        "w" | "w!" => {
+            let force = command == "w!";
+            if !force {
+                if let Some(msg) = check_frame_length(app) {
+                    app.message = Some((msg, Instant::now()));
+                    return Ok(());
+                }
             }
-            if parts.len() >= 2 {
-                let path = parts[1];
-                app.buffer.save_as(Path::new(path))?;
-                app.buffer
-                    .set_source(FileSource::Binary(std::path::PathBuf::from(path)));
-                app.message = Some((format!("Saved as {}", path), Instant::now()));
-            } else {
-                app.buffer.save()?;
-                app.message = Some(("Saved".to_string(), Instant::now()));
-            }
+            handle_write(app, &parts[1..], force, pending_range, pending_segments)?;
         }
         "q" => {
             if app.buffer.is_dirty() {
@@ -55,18 +49,6 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         }
         "q!" => {
             app.running = false;
-        }
-        "w!" => {
-            if parts.len() >= 2 {
-                let path = parts[1];
-                app.buffer.save_as(Path::new(path))?;
-                app.buffer
-                    .set_source(FileSource::Binary(std::path::PathBuf::from(path)));
-                app.message = Some((format!("Saved as {}", path), Instant::now()));
-            } else {
-                app.buffer.save()?;
-                app.message = Some(("Saved".to_string(), Instant::now()));
-            }
         }
         "wq" => {
             if let Some(msg) = check_frame_length(app) {
@@ -342,8 +324,12 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
         }
     }
 
-    // 防止残留：确保 pending_segments 在任何命令执行后清空
-    app.pending_segments = None;
+    // 防止残留：确保 pending_segments 在任何命令执行后清空；
+    // 例外：:w 因目标已存在拒绝时已把选区还原回 app（供 :w! 重试），此时保留。还原时
+    // pending_range 与 segments 成对写回，故以 pending_range 是否有值作为判据。
+    if app.pending_range.is_none() {
+        app.pending_segments = None;
+    }
     Ok(())
 }
 
@@ -699,6 +685,209 @@ fn parse_offset(s: &str) -> Result<usize> {
         s.parse::<usize>()
             .map_err(|e| anyhow::anyhow!("Invalid offset: {}", e))
     }
+}
+
+/// 解析 :w 的长度参数：`+` 开头；`+L200` 十进制、`+0xA0` 十六进制、`+200` 十进制。
+fn parse_len_arg(s: &str) -> Result<usize> {
+    let body = s
+        .strip_prefix('+')
+        .ok_or_else(|| anyhow::anyhow!("Length argument must start with '+'"))?;
+    let len = if let Some(dec) = body.strip_prefix('L').or_else(|| body.strip_prefix('l')) {
+        dec.parse::<usize>()
+            .map_err(|e| anyhow::anyhow!("Invalid length: {}", e))?
+    } else if body.starts_with("0x") || body.starts_with("0X") {
+        usize::from_str_radix(&body[2..], 16)
+            .map_err(|e| anyhow::anyhow!("Invalid hex length: {}", e))?
+    } else {
+        body.parse::<usize>()
+            .map_err(|e| anyhow::anyhow!("Invalid length: {}", e))?
+    };
+    if len == 0 {
+        bail!("Length must be > 0");
+    }
+    Ok(len)
+}
+
+/// 解析 :w 的范围参数，返回含两端的 (start, end)。
+/// 形式：`+L200`/`+0xA0`（自光标起指定长度）、`$`（自光标到文件末尾）、
+/// `start +len`（自指定偏移起指定长度）、`start end`（绝对范围，含两端）、
+/// `start $`（自指定偏移到最后）。越界报错而非静默钳制。
+fn parse_extract_range(args: &[&str], cursor: usize, buf_len: usize) -> Result<(usize, usize)> {
+    let from_len = |start: usize, len: usize| -> Result<(usize, usize)> {
+        if start >= buf_len {
+            bail!("Offset 0x{:X} is beyond file (len 0x{:X})", start, buf_len);
+        }
+        let end = start
+            .checked_add(len - 1)
+            .filter(|&e| e < buf_len)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Range 0x{:X}+{} exceeds file (len 0x{:X})",
+                    start,
+                    len,
+                    buf_len
+                )
+            })?;
+        Ok((start, end))
+    };
+    match args.len() {
+        1 => {
+            if args[0] == "$" || args[0] == "end" {
+                // 自光标（含）到文件末尾；光标必在缓冲区内（len≥1）
+                from_len(cursor, buf_len.saturating_sub(cursor))
+            } else if !args[0].starts_with('+') {
+                bail!("Usage: :w <path> [+L<len>|$|<start> <end>|<start> +L<len>|<start> $]");
+            } else {
+                from_len(cursor, parse_len_arg(args[0])?)
+            }
+        }
+        2 => {
+            let start = parse_offset(args[0])?;
+            if args[1] == "$" || args[1] == "end" {
+                // 自指定偏移（含）到文件末尾
+                if start >= buf_len {
+                    bail!("Offset 0x{:X} is beyond file (len 0x{:X})", start, buf_len);
+                }
+                Ok((start, buf_len - 1))
+            } else if args[1].starts_with('+') {
+                from_len(start, parse_len_arg(args[1])?)
+            } else {
+                let end = parse_offset(args[1])?;
+                if end < start {
+                    bail!("End offset 0x{:X} is before start 0x{:X}", end, start);
+                }
+                if end >= buf_len {
+                    bail!("End offset 0x{:X} is beyond file (len 0x{:X})", end, buf_len);
+                }
+                Ok((start, end))
+            }
+        }
+        _ => bail!("Usage: :w <path> [+L<len>|$|<start> <end>|<start> +L<len>|<start> $]"),
+    }
+}
+
+/// 截取范围写出（含两端）：大文件模式下仅与覆写层相交时产生副本。
+/// 注意：截取写不修改 buffer 的 source（只是导出一段数据）。
+fn write_range_to(app: &App, path: &str, start: usize, end: usize) -> Result<usize> {
+    if end >= app.buffer.len() {
+        bail!("Range end 0x{:X} is beyond file (len 0x{:X})", end, app.buffer.len());
+    }
+    let data = app.buffer.get_range(start, end - start + 1);
+    std::fs::write(path, &data[..])
+        .with_context(|| format!("Failed to write file: {}", path))?;
+    Ok(end - start + 1)
+}
+
+/// Block 选区逐段拼接写出（与校验和对 pending_segments 的处理一致）。
+fn write_segments_to(app: &App, path: &str, segments: &[(usize, usize)]) -> Result<usize> {
+    let mut data = Vec::new();
+    for &(start, end) in segments {
+        if end >= start && start < app.buffer.len() {
+            let len = (end - start + 1).min(app.buffer.len() - start);
+            data.extend_from_slice(&app.buffer.get_range(start, len));
+        }
+    }
+    if data.is_empty() {
+        bail!("Selection is empty, nothing to write");
+    }
+    std::fs::write(path, &data)
+        .with_context(|| format!("Failed to write file: {}", path))?;
+    Ok(data.len())
+}
+
+/// :w / :w! 统一处理：
+/// - 无路径：保存原文件；有暂存选区且非 ! 时警告拒绝（避免误将整份写盘）
+/// - 有路径无范围参数：有暂存选区则截取选区，否则整文件另存（另存后 source 切到新路径）
+/// - 有路径带范围参数：按解析出的范围截取写出（不修改 source）
+/// - 目标已存在且非 ! 时拒绝（选区/范围场景在消息中写明只会写入哪部分）
+fn handle_write(
+    app: &mut App,
+    args: &[&str],
+    force: bool,
+    pending_range: Option<(usize, usize)>,
+    pending_segments: Option<Vec<(usize, usize)>>,
+) -> Result<()> {
+    if args.is_empty() {
+        if !force && (pending_range.is_some() || pending_segments.is_some()) {
+            // 还原选区：用户后续 :w! 或重新选路径时仍可使用
+            app.pending_range = pending_range;
+            app.pending_segments = pending_segments;
+            bail!("Selection active: use ':w <path>' to save it, or ':w!' to save the whole file");
+        }
+        app.buffer.save()?;
+        app.message = Some(("Saved".to_string(), Instant::now()));
+        return Ok(());
+    }
+
+    let path = args[0];
+    enum Target {
+        Whole,
+        Range(usize, usize),
+        Segments(Vec<(usize, usize)>),
+    }
+    let target = if args.len() == 1 {
+        if let Some(segs) = &pending_segments {
+            Target::Segments(segs.clone())
+        } else if let Some((s, e)) = pending_range {
+            Target::Range(s, e)
+        } else {
+            Target::Whole
+        }
+    } else {
+        let (s, e) = parse_extract_range(&args[1..], app.cursor_offset, app.buffer.len())?;
+        Target::Range(s, e)
+    };
+
+    // 目标已存在：非 ! 拒绝，消息写明将写入的内容（整份 / 选区范围 / 块段）；
+    // 选区还原回 app，用户可直接以 :w! 重试（无需重新选择）
+    if Path::new(path).exists() && !force {
+        let detail = match &target {
+            Target::Whole => String::new(),
+            Target::Range(s, e) => format!(
+                " only selection 0x{:X}-0x{:X} ({} B) would be written,",
+                s,
+                e,
+                e - s + 1
+            ),
+            Target::Segments(segs) => {
+                format!(" only {} block segments would be written,", segs.len())
+            }
+        };
+        if matches!(target, Target::Range(..) | Target::Segments(..)) {
+            app.pending_range = pending_range;
+            app.pending_segments = pending_segments;
+        }
+        bail!(
+            "File exists:{} use :w! to overwrite: {}",
+            detail,
+            path
+        );
+    }
+
+    match target {
+        Target::Whole => {
+            app.buffer.save_as(Path::new(path))?;
+            app.buffer
+                .set_source(FileSource::Binary(std::path::PathBuf::from(path)));
+            app.message = Some((format!("Saved as {}", path), Instant::now()));
+        }
+        Target::Range(s, e) => {
+            let n = write_range_to(app, path, s, e)?;
+            app.message = Some((
+                format!("Wrote 0x{:X}-0x{:X} ({} B) to {}", s, e, n, path),
+                Instant::now(),
+            ));
+        }
+        Target::Segments(segs) => {
+            let count = segs.len();
+            let n = write_segments_to(app, path, &segs)?;
+            app.message = Some((
+                format!("Wrote {} block segments ({} B) to {}", count, n, path),
+                Instant::now(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 解析替换命令，返回 (是否全局, old, new)
@@ -1276,5 +1465,139 @@ mod tests {
         execute_command(&mut app, "overpaste").unwrap();
         assert!(app.message.is_some(), "应提示 Nothing yanked");
         assert_eq!(&app.buffer.get_range(0, 8)[..], &[7u8; 8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // :w 截取写出（相对长度 / 绝对范围 / 选区 / 覆盖确认）
+    // -----------------------------------------------------------------------
+
+    fn tmp_w_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hrush_w_{}_{}.bin", name, std::process::id()))
+    }
+
+    /// 相对长度：`+L3` 自光标（含）截取；十六进制 `+0x2` 等价；截取不修改 source
+    #[test]
+    fn write_relative_len_from_cursor() {
+        let path = tmp_w_path("relen");
+        let mut app = app_with_data(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        app.cursor_offset = 2;
+        execute_command(&mut app, &format!("w {} +L3", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![3, 4, 5]);
+        assert!(matches!(app.buffer.source(), FileSource::New), "截取写不切换 source");
+        std::fs::remove_file(&path).ok();
+
+        let mut app = app_with_data(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        app.cursor_offset = 4;
+        execute_command(&mut app, &format!("w {} +0x2", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![5, 6]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 指定偏移 + 相对长度；绝对范围含两端；越界/长度零/倒序报错不写文件
+    #[test]
+    fn write_offset_plus_len_and_absolute_range() {
+        let path = tmp_w_path("offlen");
+        let mut app = app_with_data(&[0xA, 0xB, 0xC, 0xD, 0xE]);
+        execute_command(&mut app, &format!("w {} 0x1 +L2", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xB, 0xC]);
+        execute_command(&mut app, &format!("w! {} 1 3", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xB, 0xC, 0xD]);
+
+        // 边界/非法参数：不写文件、不改数据、错误可报出
+        let err = execute_command(&mut app, &format!("w {} +L100", path.display())).unwrap_err();
+        assert!(err.to_string().contains("exceeds file"), "实际: {}", err);
+        let err = execute_command(&mut app, &format!("w {} +L0", path.display())).unwrap_err();
+        assert!(err.to_string().contains("> 0"), "实际: {}", err);
+        let err = execute_command(&mut app, &format!("w {} 3 1", path.display())).unwrap_err();
+        assert!(err.to_string().contains("before start"), "实际: {}", err);
+        let err = execute_command(&mut app, &format!("w {} zz", path.display())).unwrap_err();
+        assert!(err.to_string().contains("Usage"), "实际: {}", err);
+
+        // `$` 到文件末尾：自光标 / 自指定偏移；光标在末字节时写出 1 字节；起点的 `end` 别名等价；越界报错
+        app.cursor_offset = 2;
+        execute_command(&mut app, &format!("w! {} $", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xC, 0xD, 0xE]);
+        execute_command(&mut app, &format!("w! {} 0x3 $", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xD, 0xE]);
+        execute_command(&mut app, &format!("w! {} 4 end", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xE]);
+        app.cursor_offset = 4;
+        execute_command(&mut app, &format!("w! {} $", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xE], "光标在末字节时写出 1 字节");
+        let err = execute_command(&mut app, &format!("w {} 0x99 $", path.display())).unwrap_err();
+        assert!(err.to_string().contains("beyond file"), "实际: {}", err);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 暂存选区（Visual → `:`）：`:w path` 只写选区；目标已存在时报错且写明只会写选区部分；
+    /// `:w!` 强制覆盖；无路径 `:w` 警告拒绝（避免误存整份），`:w!` 显式存整份
+    #[test]
+    fn write_selection_guards() {
+        let path = tmp_w_path("sel");
+        let src_path = tmp_w_path("sel_src");
+
+        let mut app = app_with_data(&[1, 2, 3, 4, 5, 6]);
+        app.buffer.set_source(FileSource::Binary(src_path.clone()));
+        app.pending_range = Some((1, 3));
+        execute_command(&mut app, &format!("w {}", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![2, 3, 4]);
+        assert!(matches!(app.buffer.source(), FileSource::Binary(p) if *p == src_path),
+            "选区截取不应切换 source");
+
+        // 已存在：`:w` 拒绝且消息含选区信息；选区被还原，`:w!` 直接重试覆盖（无需重选）
+        app.pending_range = Some((4, 5));
+        let err = execute_command(&mut app, &format!("w {}", path.display())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("File exists") && msg.contains("would be written"), "实际: {}", msg);
+        assert_eq!(app.pending_range, Some((4, 5)), "拒绝后选区应还原供重试");
+        execute_command(&mut app, &format!("w! {}", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![5, 6]);
+        assert_eq!(app.pending_range, None, "成功写入后选区已消费");
+
+        // 无路径 + 选区：警告拒绝；`!` 显式确认后存整份原文件
+        app.pending_range = Some((1, 3));
+        let err = execute_command(&mut app, "w").unwrap_err();
+        assert!(err.to_string().contains("Selection active"), "实际: {}", err);
+        app.pending_range = Some((1, 3));
+        execute_command(&mut app, "w!").unwrap();
+        assert_eq!(std::fs::read(&src_path).unwrap(), vec![1, 2, 3, 4, 5, 6], "! 显式存整份");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&src_path).ok();
+    }
+
+    /// 整文件另存：目标已存在时 `:w` 拒绝、`:w!` 覆盖且 source 切到新路径；
+    /// 无选区无路径 `:w` 照常保存（不受选区拦截影响）
+    #[test]
+    fn write_whole_file_guards_and_source_switch() {
+        let path = tmp_w_path("whole");
+        let mut app = app_with_data(&[9, 8, 7]);
+        execute_command(&mut app, &format!("w {}", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9, 8, 7]);
+        assert!(matches!(app.buffer.source(), FileSource::Binary(p) if *p == path));
+
+        // 已存在：拒绝 → ! 覆盖（行为同 vim E13）
+        app.buffer.set_byte(0, 0xFF);
+        let err = execute_command(&mut app, &format!("w {}", path.display())).unwrap_err();
+        assert!(err.to_string().contains("File exists"), "实际: {}", err);
+        execute_command(&mut app, &format!("w! {}", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xFF, 8, 7]);
+
+        // 无选区无路径：照常保存原文件（source 已指向 path）
+        app.buffer.set_byte(1, 0xEE);
+        execute_command(&mut app, "w").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xFF, 0xEE, 7]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Block 逐段选区：拼接写出（与校验和的 segments 语义一致）
+    #[test]
+    fn write_block_segments_concatenated() {
+        let path = tmp_w_path("segs");
+        let mut app = app_with_data(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        app.pending_segments = Some(vec![(1, 2), (5, 6)]);
+        execute_command(&mut app, &format!("w {}", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 5, 6]);
+        std::fs::remove_file(&path).ok();
     }
 }
