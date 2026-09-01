@@ -772,7 +772,8 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
             app.history_index = None;
             match search::parse_pattern(&input) {
                 Ok(pattern) => {
-                    let data = app.buffer.data().to_vec();
+                    // 零拷贝共享数据快照（搜索期间若发生编辑，Buffer 写时分离，快照不受影响）
+                    let data = app.buffer.shared_data();
                     app.search_state.start_search(data, pattern);
                 }
                 Err(e) => {

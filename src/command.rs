@@ -736,7 +736,8 @@ fn execute_substitute(app: &mut App, global: bool, old: &str, new: &str) -> Resu
         });
 
         if need_search {
-            let data = app.buffer.data().to_vec();
+            // 零拷贝共享数据快照（搜索期间若发生编辑，Buffer 写时分离，快照不受影响）
+            let data = app.buffer.shared_data();
             app.search_state.start_search(data, old_pat.clone());
             // 对于替换操作，需要等待搜索完成后才能替换
             // 等待异步搜索完成（最多等待 5 秒）

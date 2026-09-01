@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -12,7 +13,11 @@ pub enum FileSource {
 }
 
 pub struct Buffer {
-    data: Vec<u8>,
+    /// 文件字节数据。用 Arc 包装以便搜索线程零拷贝共享快照；
+    /// 编辑路径通过 Arc::make_mut 写时分离：无共享时原地修改（零开销），
+    /// 搜索进行中发生编辑时自动克隆，搜索线程继续持有旧快照，
+    /// 语义与原先搜索前整份 to_vec 快照完全一致。
+    data: Arc<Vec<u8>>,
     modified: HashSet<usize>,
     dirty: bool,
     source: FileSource,
@@ -21,7 +26,7 @@ pub struct Buffer {
 impl Buffer {
     pub fn new() -> Self {
         Self {
-            data: Vec::new(),
+            data: Arc::new(Vec::new()),
             modified: HashSet::new(),
             dirty: false,
             source: FileSource::New,
@@ -32,7 +37,7 @@ impl Buffer {
     #[allow(dead_code)]
     pub fn with_data(data: &[u8]) -> Self {
         Self {
-            data: data.to_vec(),
+            data: Arc::new(data.to_vec()),
             modified: HashSet::new(),
             dirty: false,
             source: FileSource::New,
@@ -43,7 +48,7 @@ impl Buffer {
         let data = fs::read(path)
             .with_context(|| format!("Failed to read file: {}", path.display()))?;
         Ok(Self {
-            data,
+            data: Arc::new(data),
             modified: HashSet::new(),
             dirty: false,
             source: FileSource::Binary(path.to_path_buf()),
@@ -53,7 +58,7 @@ impl Buffer {
     pub fn from_hex_import(path: &Path) -> Result<Self> {
         let data = crate::import::parse_hex_file(path)?;
         Ok(Self {
-            data,
+            data: Arc::new(data),
             modified: HashSet::new(),
             dirty: false,
             source: FileSource::HexImport(path.to_path_buf()),
@@ -79,22 +84,28 @@ impl Buffer {
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.data
+        &self.data[..]
+    }
+
+    /// 克隆一份数据共享句柄（仅增加引用计数，零拷贝），
+    /// 供异步搜索线程持有快照。
+    pub fn shared_data(&self) -> Arc<Vec<u8>> {
+        Arc::clone(&self.data)
     }
 
     pub fn set_byte(&mut self, offset: usize, value: u8) {
-        if let Some(byte) = self.data.get_mut(offset) {
-            if *byte != value {
-                *byte = value;
-                self.modified.insert(offset);
-                self.dirty = true;
-            }
+        // 先用只读路径判断是否需要写入，避免同值写入触发 make_mut 克隆
+        if self.data.get(offset).map_or(false, |&b| b != value) {
+            Arc::make_mut(&mut self.data)[offset] = value;
+            self.modified.insert(offset);
+            self.dirty = true;
         }
     }
 
     pub fn insert_byte(&mut self, offset: usize, value: u8) {
         let offset = offset.min(self.data.len());
-        self.data.insert(offset, value);
+        let data = Arc::make_mut(&mut self.data);
+        data.insert(offset, value);
 
         // 先平移已有的 modified 索引
         let mut new_modified = HashSet::new();
@@ -116,7 +127,7 @@ impl Buffer {
         if offset >= self.data.len() {
             return None;
         }
-        let value = self.data.remove(offset);
+        let value = Arc::make_mut(&mut self.data).remove(offset);
         // Shift modified indices
         let mut new_modified = HashSet::new();
         for &idx in &self.modified {
@@ -134,11 +145,12 @@ impl Buffer {
     }
 
     pub fn insert_bytes(&mut self, offset: usize, bytes: &[u8]) {
-        let offset = offset.min(self.data.len());
+        let data = Arc::make_mut(&mut self.data);
+        let offset = offset.min(data.len());
         let len = bytes.len();
 
         // 使用 splice 一次性插入
-        self.data.splice(offset..offset, bytes.iter().copied());
+        data.splice(offset..offset, bytes.iter().copied());
 
         // 批量更新 modified 索引：offset 以上的全部 +len
         let mut new_modified = HashSet::new();
@@ -169,7 +181,8 @@ impl Buffer {
         let old_len = self.data.len();
         let total: usize = sorted.iter().map(|(_, b)| b.len()).sum();
 
-        // 一次遍历构造新数据（分段拷贝 + 插入点拼接）
+        // 一次遍历构造新数据（分段拷贝 + 插入点拼接）；
+        // 直接替换 Arc（而非 make_mut），搜索线程持有的旧快照不受影响且不触发额外克隆
         let mut new_data = Vec::with_capacity(old_len + total);
         let mut prev = 0usize;
         for k in 0..=sorted.len() {
@@ -182,7 +195,7 @@ impl Buffer {
             new_data.extend_from_slice(sorted[k].1);
             prev = off;
         }
-        self.data = new_data;
+        self.data = Arc::new(new_data);
 
         // 一次遍历重映射 modified 索引（双指针，避免逐段重建集合）
         let mut sorted_idx: Vec<usize> = self.modified.iter().copied().collect();
@@ -211,9 +224,10 @@ impl Buffer {
     }
 
     pub fn remove_range(&mut self, offset: usize, len: usize) -> Vec<u8> {
-        let end = (offset + len).min(self.data.len());
+        let data = Arc::make_mut(&mut self.data);
+        let end = (offset + len).min(data.len());
         let actual_len = end - offset;
-        let removed: Vec<u8> = self.data.drain(offset..end).collect();
+        let removed: Vec<u8> = data.drain(offset..end).collect();
 
         // 批量更新 modified 索引
         let mut new_modified = HashSet::new();
@@ -263,7 +277,7 @@ impl Buffer {
             return;
         }
 
-        // 一次遍历构造新数据（跳过被删段）
+        // 一次遍历构造新数据（跳过被删段）；直接替换 Arc，避免 make_mut 额外克隆
         let total: usize = clipped.iter().map(|&(_, l)| l).sum();
         let mut new_data = Vec::with_capacity(old_len.saturating_sub(total));
         let mut prev = 0usize;
@@ -272,7 +286,7 @@ impl Buffer {
             prev = off + len;
         }
         new_data.extend_from_slice(&self.data[prev..]);
-        self.data = new_data;
+        self.data = Arc::new(new_data);
 
         // 一次遍历重映射 modified 索引（落在被删段内的丢弃，其后的左移）
         let mut sorted_idx: Vec<usize> = self.modified.iter().copied().collect();
@@ -305,12 +319,12 @@ impl Buffer {
     pub fn save(&mut self) -> Result<()> {
         match &self.source {
             FileSource::Binary(path) => {
-                fs::write(path, &self.data)
+                fs::write(path, &self.data[..])
                     .with_context(|| format!("Failed to save file: {}", path.display()))?;
             }
             FileSource::HexImport(path) => {
                 let bin_path = Self::infer_bin_path(path);
-                fs::write(&bin_path, &self.data)
+                fs::write(&bin_path, &self.data[..])
                     .with_context(|| format!("Failed to save file: {}", bin_path.display()))?;
             }
             FileSource::New => {
@@ -331,7 +345,7 @@ impl Buffer {
     }
 
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
-        fs::write(path, &self.data)
+        fs::write(path, &self.data[..])
             .with_context(|| format!("Failed to save file: {}", path.display()))?;
         self.dirty = false;
         self.modified.clear();
@@ -360,5 +374,33 @@ impl Buffer {
 impl Default for Buffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_snapshot_isolated_from_later_edits() {
+        // 写时分离语义：共享快照后再编辑，快照保留旧数据，
+        // 与原先搜索前 to_vec 快照的行为一致（搜索线程不受后续编辑影响）
+        let mut buf = Buffer::with_data(&[1, 2, 3]);
+        let snap = buf.shared_data();
+        buf.set_byte(0, 0xFF);
+        buf.insert_byte(3, 0x99);
+        assert_eq!(snap.as_slice(), &[1, 2, 3], "快照不应受后续编辑影响");
+        assert_eq!(buf.data(), &[0xFF, 2, 3, 0x99]);
+    }
+
+    #[test]
+    fn edits_without_sharing_are_in_place() {
+        // 无共享时编辑不应发生克隆（引用计数保持 1）
+        let mut buf = Buffer::with_data(&[1, 2, 3]);
+        buf.set_byte(0, 0xAA);
+        buf.insert_byte(1, 0xBB);
+        buf.remove_byte(3);
+        assert_eq!(Arc::strong_count(&buf.data), 1);
+        assert_eq!(buf.data(), &[0xAA, 0xBB, 2]);
     }
 }

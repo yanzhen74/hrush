@@ -77,8 +77,8 @@ impl SearchState {
         }
     }
 
-    /// 启动后台线程搜索
-    pub fn start_search(&mut self, data: Vec<u8>, pattern: SearchPattern) {
+    /// 启动后台线程搜索（data 由调用方通过 Buffer::shared_data 零拷贝共享）
+    pub fn start_search(&mut self, data: Arc<Vec<u8>>, pattern: SearchPattern) {
         self.clear();
 
         let pat_len = pattern.len();
@@ -112,7 +112,7 @@ impl SearchState {
         let pat = pattern.pattern();
 
         let handle = thread::spawn(move || {
-            find_all_matches(&data, &pat, Some(&cancel_flag), Some(&progress))
+            find_all_matches(data.as_slice(), &pat, Some(&cancel_flag), Some(&progress))
         });
 
         self.search_handle = Some(handle);
@@ -549,7 +549,7 @@ mod tests {
     /// 同步执行一次搜索并返回匹配位置（内部仍走异步线程 + poll）
     fn run_search(data: Vec<u8>, pattern: SearchPattern) -> Vec<usize> {
         let mut state = SearchState::new();
-        state.start_search(data, pattern);
+        state.start_search(Arc::new(data), pattern);
         while !state.poll_result() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -664,6 +664,23 @@ mod tests {
             "64MB 精确搜索耗时 {:?}，SIMD 快路径应远快于此",
             elapsed
         );
+    }
+
+    #[test]
+    #[ignore] // 手动执行：cargo test --release search_peak_memory_report -- --ignored --nocapture
+    fn search_peak_memory_report() {
+        // 256MB 数据：搜索线程零拷贝共享 Arc，搜索期间峰值 RSS 应≈一份数据；
+        // 优化前（to_vec 快照）约为两份。
+        let data = vec![0xABu8; 256 * 1024 * 1024];
+        let mut state = SearchState::new();
+        state.start_search(Arc::new(data), parse_pattern("x:DEADBEEF").unwrap());
+        while !state.poll_result() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(state.matches.is_empty());
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let hwm = status.lines().find(|l| l.starts_with("VmHWM")).unwrap_or("VmHWM: n/a");
+        eprintln!("搜索完成后峰值 RSS（{}）", hwm.trim());
     }
 
     #[test]
