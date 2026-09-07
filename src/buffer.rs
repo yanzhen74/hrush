@@ -68,6 +68,14 @@ impl DataSnapshot {
             Self::Mapped { overlay, .. } => Some(overlay),
         }
     }
+
+    /// 读取含覆写层的有效字节（调用方保证 i < len）；供 diff 逐字节比对零拷贝访问
+    pub fn byte_at(&self, i: usize) -> u8 {
+        match self {
+            Self::Mem(v) => v[i],
+            Self::Mapped { mmap, overlay } => overlay.get(&i).copied().unwrap_or(mmap[i]),
+        }
+    }
 }
 
 impl Buffer {

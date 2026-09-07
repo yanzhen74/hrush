@@ -1,6 +1,6 @@
 use ratatui::Frame as RatatuiFrame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -115,18 +115,34 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
             None
         };
 
-        // 行头
+        // 行头：含差异字节的帧在标记位显示红色 !（宽度固定 1 列，对齐不变）
+        let has_diff = app
+            .diff
+            .as_ref()
+            .map(|d| d.intersects(frame.offset, frame.length))
+            .unwrap_or(false);
+        let header_style =
+            Style::default().fg(Color::Gray).bg(base_bg.unwrap_or(Color::Reset));
         let header_text = format!(
-            "#{:04} @{:08X} L{:>width$} | ",
+            "#{:04} @{:08X} L{:>width$}",
             frame_idx + 1,
             frame.offset,
             frame.length,
             width = len_digits
         );
-        let mut spans = vec![Span::styled(
-            header_text,
-            Style::default().fg(Color::Gray).bg(base_bg.unwrap_or(Color::Reset)),
-        )];
+        let mut spans = vec![Span::styled(header_text, header_style)];
+        if has_diff {
+            spans.push(Span::styled(
+                "!",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(base_bg.unwrap_or(Color::Reset)),
+            ));
+        } else {
+            spans.push(Span::styled(" ", header_style));
+        }
+        spans.push(Span::styled("| ", header_style));
 
         for i in 0..visible_bytes {
             let byte_offset = frame.offset + app.h_scroll_offset + i;
@@ -148,6 +164,11 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
                     let is_cursor_byte = app.cursor_offset == byte_offset;
                     let is_search_match = app.search_state.is_match_byte(byte_offset);
                     let is_current_match = app.search_state.is_current_match_byte(byte_offset);
+                    let is_diff = app
+                        .diff
+                        .as_ref()
+                        .map(|d| d.contains(byte_offset))
+                        .unwrap_or(false);
                     let is_visual_selected = if let Some((min_row, max_row, min_col, max_col)) = block_rect {
                         // Block 模式：row = 帧序号，col = 帧内偏移
                         let col = byte_offset.saturating_sub(frame.offset);
@@ -166,6 +187,9 @@ pub fn render_frame_view(f: &mut RatatuiFrame, area: Rect, app: &App) {
                         (Color::White, Some(Color::Indexed(214)))
                     } else if is_search_match {
                         (Color::White, Some(Color::Indexed(130)))
+                    } else if is_diff {
+                        // diff 差异字节：深红背景（与 hex_view 一致）
+                        (Color::White, Some(Color::Indexed(124)))
                     } else {
                         let fg = if is_modified { Color::Yellow } else { Color::White };
                         (fg, base_bg)
@@ -245,5 +269,51 @@ mod tests {
         assert_eq!(cell_bg(4), Color::Indexed(39), "选中字节应有选区背景色");
         assert_eq!(cell_bg(5), Color::White, "光标字节保持光标样式（白底）");
         assert_eq!(cell_bg(6), Color::Indexed(236), "选区外字节不应有选区背景");
+    }
+
+    /// frame 视图 diff：差异字节深红背景高亮，含差异的帧行头标红色 !，无差异帧行头保持空格对齐
+    #[test]
+    fn frame_view_renders_diff_highlight_and_header_marker() {
+        let mut app = App::new();
+        app.buffer = Buffer::with_data(&[0xABu8; 64]);
+        let index = build_frame_index(
+            app.buffer.data(),
+            &FrameConfig::FixedLength { length: 32 },
+        );
+        app.frame_index = Some(index);
+        app.view_mode = ViewMode::Frame;
+        app.cursor_offset = 0; // 光标在帧 0
+        // 差异段：仅帧 0 的字节 2..=3（帧 1 无差异）
+        app.diff = Some(crate::app::DiffState {
+            path: "other.bin".to_string(),
+            runs: vec![(2, 2)],
+            total_bytes: 2,
+            current: None,
+        });
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(0, 0, 80, 12);
+        terminal
+            .draw(|f| render_frame_view(f, area, &app))
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let row_y = 3;
+        let cell_bg = |byte_i: u16| buf[(1 + 22 + byte_i * 3, row_y)].bg;
+
+        // 差异字节深红背景；光标字节白底优先；非差异字节继承光标行背景
+        assert_eq!(cell_bg(0), Color::White, "光标字节保持光标样式");
+        assert_eq!(cell_bg(2), Color::Indexed(124), "diff 字节应深红背景高亮");
+        assert_eq!(cell_bg(3), Color::Indexed(124), "diff 字节应深红背景高亮");
+        assert_eq!(cell_bg(4), Color::Indexed(236), "非差异字节继承光标行背景");
+
+        // 行头标记位：行头前缀 19 列（边框 1 + 前缀 19），标记在列 20
+        assert_eq!(buf[(20, row_y)].symbol(), "!", "含差异帧行头应标 !");
+        assert_eq!(buf[(20, row_y)].fg, Color::Red);
+        let frame1_y = row_y + 1;
+        assert_eq!(buf[(20, frame1_y)].symbol(), " ", "无差异帧行头保持空格对齐");
+        // 帧 1 数据字节无 diff 背景（非光标行，背景为默认）
+        assert_ne!(buf[(1 + 22, frame1_y)].bg, Color::Indexed(124));
     }
 }

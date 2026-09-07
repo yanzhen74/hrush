@@ -4,6 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::app::DiffState;
 use crate::buffer::Buffer;
 use crate::search::SearchState;
 use crate::ui::Panel;
@@ -18,6 +19,7 @@ pub fn draw(
     search_state: &SearchState,
     visual_range: Option<(usize, usize)>,
     block_rect: Option<(usize, usize, usize, usize)>,
+    diff: Option<&DiffState>,
 ) {
     let block = Block::default()
         .title(" Hex View ")
@@ -92,6 +94,7 @@ pub fn draw(
 
                 let is_search_match = search_state.is_match_byte(offset);
                 let is_current_match = search_state.is_current_match_byte(offset);
+                let is_diff = diff.map(|d| d.contains(offset)).unwrap_or(false);
                 let is_visual_selected = if let Some((min_row, max_row, min_col, max_col)) = block_rect {
                     let row = offset / 16;
                     let col = offset % 16;
@@ -110,6 +113,9 @@ pub fn draw(
                     (Color::White, Some(Color::Indexed(214)))
                 } else if is_search_match {
                     (Color::White, Some(Color::Indexed(130)))
+                } else if is_diff {
+                    // diff 差异字节：深红背景（优先级低于光标/选区/搜索匹配）
+                    (Color::White, Some(Color::Indexed(124)))
                 } else {
                     let fg = if is_modified { Color::Yellow } else { Color::White };
                     (fg, base_bg)
@@ -123,6 +129,8 @@ pub fn draw(
                     (Color::White, Some(Color::Indexed(214)))
                 } else if is_search_match {
                     (Color::White, Some(Color::Indexed(130)))
+                } else if is_diff {
+                    (Color::White, Some(Color::Indexed(124)))
                 } else {
                     let fg = if is_modified { Color::Yellow } else { Color::White };
                     (fg, base_bg)

@@ -307,6 +307,55 @@ pub fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
             // Ctrl+P 在被 IDE/终端截获的环境不可用，提供命令入口
             crate::input::do_overwrite_paste(app);
         }
+        "marks" => {
+            // 列出已设置的书签（message 展示，不另建浮层）
+            let list: Vec<String> = app
+                .marks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    m.map(|pos| format!("{}:0x{:X}", (b'a' + i as u8) as char, pos))
+                })
+                .collect();
+            app.message = Some((
+                if list.is_empty() {
+                    "No marks set".to_string()
+                } else {
+                    format!("marks {}", list.join(" "))
+                },
+                Instant::now(),
+            ));
+        }
+        "delmarks" | "delmarks!" => {
+            // :delmarks a b 删指定；:delmarks! 删全部（vim 惯例）
+            if command == "delmarks!" {
+                app.marks = [None; 26];
+                app.message = Some(("All marks deleted".to_string(), Instant::now()));
+            } else if parts.len() == 1 {
+                app.message = Some((
+                    "Usage: :delmarks <a-z>... or :delmarks! (all)".to_string(),
+                    Instant::now(),
+                ));
+            } else if parts[1] == "!" {
+                app.marks = [None; 26];
+                app.message = Some(("All marks deleted".to_string(), Instant::now()));
+            } else {
+                let mut deleted = 0usize;
+                for arg in &parts[1..] {
+                    for ch in arg.chars() {
+                        if ('a'..='z').contains(&ch)
+                            && app.marks[(ch as u8 - b'a') as usize].take().is_some()
+                        {
+                            deleted += 1;
+                        }
+                    }
+                }
+                app.message = Some((format!("{} mark(s) deleted", deleted), Instant::now()));
+            }
+        }
+        "diff" => {
+            handle_diff(app, &parts[1..])?;
+        }
         _ => {
             // 尝试解析为替换命令 :s/old/new 或 :%s/old/new/g
             if let Some((global, old, new)) = parse_substitute(trimmed) {
@@ -687,6 +736,20 @@ fn parse_offset(s: &str) -> Result<usize> {
     }
 }
 
+/// 解析 :w 范围参数的单个端点：书签引用 `'a`（vim :w 'a,'b 惯例）或数字偏移
+fn parse_range_endpoint(s: &str, marks: &[Option<usize>; 26]) -> Result<usize> {
+    if let Some(rest) = s.strip_prefix('\'') {
+        let mut chars = rest.chars();
+        match (chars.next(), chars.next()) {
+            (Some(ch @ 'a'..='z'), None) => marks[(ch as u8 - b'a') as usize]
+                .ok_or_else(|| anyhow::anyhow!("Mark not set: {}", ch)),
+            _ => bail!("Invalid mark reference: {}", s),
+        }
+    } else {
+        parse_offset(s)
+    }
+}
+
 /// 解析 :w 的长度参数：`+` 开头；`+L200` 十进制、`+0xA0` 十六进制、`+200` 十进制。
 fn parse_len_arg(s: &str) -> Result<usize> {
     let body = s
@@ -711,8 +774,16 @@ fn parse_len_arg(s: &str) -> Result<usize> {
 /// 解析 :w 的范围参数，返回含两端的 (start, end)。
 /// 形式：`+L200`/`+0xA0`（自光标起指定长度）、`$`（自光标到文件末尾）、
 /// `start +len`（自指定偏移起指定长度）、`start end`（绝对范围，含两端）、
-/// `start $`（自指定偏移到最后）。越界报错而非静默钳制。
-fn parse_extract_range(args: &[&str], cursor: usize, buf_len: usize) -> Result<(usize, usize)> {
+/// `start $`（自指定偏移到最后）。start/end 可为数字偏移或书签引用 `'a`。
+/// 越界报错而非静默钳制。
+fn parse_extract_range(args: &[&str], cursor: usize, buf_len: usize, marks: &[Option<usize>; 26]) -> Result<(usize, usize)> {
+    // 支持 vim 风格逗号连写：`'a,'b` / `0x10,'b` 等价于空格分隔的两参
+    let owned: Vec<&str> = args
+        .iter()
+        .flat_map(|a| a.split(','))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let args = owned.as_slice();
     let from_len = |start: usize, len: usize| -> Result<(usize, usize)> {
         if start >= buf_len {
             bail!("Offset 0x{:X} is beyond file (len 0x{:X})", start, buf_len);
@@ -742,7 +813,7 @@ fn parse_extract_range(args: &[&str], cursor: usize, buf_len: usize) -> Result<(
             }
         }
         2 => {
-            let start = parse_offset(args[0])?;
+            let start = parse_range_endpoint(args[0], marks)?;
             if args[1] == "$" || args[1] == "end" {
                 // 自指定偏移（含）到文件末尾
                 if start >= buf_len {
@@ -752,7 +823,7 @@ fn parse_extract_range(args: &[&str], cursor: usize, buf_len: usize) -> Result<(
             } else if args[1].starts_with('+') {
                 from_len(start, parse_len_arg(args[1])?)
             } else {
-                let end = parse_offset(args[1])?;
+                let end = parse_range_endpoint(args[1], marks)?;
                 if end < start {
                     bail!("End offset 0x{:X} is before start 0x{:X}", end, start);
                 }
@@ -795,6 +866,76 @@ fn write_segments_to(app: &App, path: &str, segments: &[(usize, usize)]) -> Resu
     Ok(data.len())
 }
 
+/// :diff <path> 建立差异比对（阶段一）；无参数清除活动 diff。
+/// 逐字节比对共同长度范围（当前缓冲含覆写层的有效字节 vs 目标文件），
+/// 差异合并为升序 run 列表供高亮与 `[`/`]` 导航；长度不同时比对共同前缀并在消息中注明。
+fn handle_diff(app: &mut App, args: &[&str]) -> Result<()> {
+    if args.is_empty() {
+        match app.diff.take() {
+            Some(d) => {
+                app.message = Some((format!("Diff vs {} cleared", d.path), Instant::now()));
+            }
+            None => {
+                app.message = Some((
+                    "No active diff. Usage: :diff <path>".to_string(),
+                    Instant::now(),
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let path = args[0];
+    let other = std::fs::read(path)
+        .with_context(|| format!("Failed to read file: {}", path))?;
+    // 零拷贝快照：大文件模式下逐字节读 mmap+覆写层，不产生整份副本
+    let snap = app.buffer.search_snapshot();
+    let cur_len = snap.base().len();
+    let common = cur_len.min(other.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < common {
+        if snap.byte_at(i) != other[i] {
+            let start = i;
+            while i < common && snap.byte_at(i) != other[i] {
+                i += 1;
+            }
+            runs.push((start, i - start));
+        } else {
+            i += 1;
+        }
+    }
+    let total_bytes: usize = runs.iter().map(|r| r.1).sum();
+    let regions = runs.len();
+    let len_note = if cur_len != other.len() {
+        format!(
+            " (lengths differ: {} vs {}, compared {} B)",
+            cur_len,
+            other.len(),
+            common
+        )
+    } else {
+        String::new()
+    };
+    app.diff = Some(crate::app::DiffState {
+        path: path.to_string(),
+        runs,
+        total_bytes,
+        current: None,
+    });
+    app.message = Some((
+        if regions == 0 {
+            format!("No differences in compared range{}", len_note)
+        } else {
+            format!(
+                "diff vs {}: {} differing bytes in {} regions{}. ] / [ to navigate",
+                path, total_bytes, regions, len_note
+            )
+        },
+        Instant::now(),
+    ));
+    Ok(())
+}
+
 /// :w / :w! 统一处理：
 /// - 无路径：保存原文件；有暂存选区且非 ! 时警告拒绝（避免误将整份写盘）
 /// - 有路径无范围参数：有暂存选区则截取选区，否则整文件另存（另存后 source 切到新路径）
@@ -834,7 +975,7 @@ fn handle_write(
             Target::Whole
         }
     } else {
-        let (s, e) = parse_extract_range(&args[1..], app.cursor_offset, app.buffer.len())?;
+        let (s, e) = parse_extract_range(&args[1..], app.cursor_offset, app.buffer.len(), &app.marks)?;
         Target::Range(s, e)
     };
 
@@ -1598,6 +1739,97 @@ mod tests {
         app.pending_segments = Some(vec![(1, 2), (5, 6)]);
         execute_command(&mut app, &format!("w {}", path.display())).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 5, 6]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// :marks 列表、:delmarks 删除（指定/全部）、无参数 usage 提示
+    #[test]
+    fn marks_commands_list_and_delete() {
+        let mut app = app_with_data(&[0u8; 16]);
+        execute_command(&mut app, "marks").unwrap();
+        assert!(app.message.as_ref().unwrap().0.contains("No marks set"));
+
+        app.marks[0] = Some(3); // a
+        app.marks[25] = Some(10); // z
+        execute_command(&mut app, "marks").unwrap();
+        let msg = app.message.as_ref().unwrap().0.clone();
+        assert!(msg.contains("a:0x3") && msg.contains("z:0xA"), "实际: {}", msg);
+
+        execute_command(&mut app, "delmarks a").unwrap();
+        assert_eq!(app.marks[0], None);
+        assert_eq!(app.marks[25], Some(10));
+
+        execute_command(&mut app, "delmarks!").unwrap();
+        assert!(app.marks.iter().all(|m| m.is_none()));
+
+        execute_command(&mut app, "delmarks").unwrap();
+        assert!(app.message.as_ref().unwrap().0.contains("Usage"));
+    }
+
+    /// :diff 逐字节比对建立 run 列表、contains 二分边界、清除、长度不同注记、不存在报错
+    #[test]
+    fn diff_command_builds_runs_and_clears() {
+        let path = tmp_w_path("diff");
+        let mut app = app_with_data(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        std::fs::write(&path, &[1, 2, 0xC, 0xD, 5, 0xF, 0xF, 8]).unwrap();
+
+        execute_command(&mut app, &format!("diff {}", path.display())).unwrap();
+        let diff = app.diff.as_ref().unwrap();
+        assert_eq!(diff.runs, vec![(2, 2), (5, 2)]);
+        assert_eq!(diff.total_bytes, 4);
+        // contains 二分边界：段首/段尾/段外
+        assert!(!diff.contains(1));
+        assert!(diff.contains(2));
+        assert!(diff.contains(3));
+        assert!(!diff.contains(4));
+        assert!(diff.contains(6));
+        assert!(!diff.contains(7));
+
+        // diff 状态下编辑后再比对：覆写后的有效字节参与比对（快照语义）
+        app.buffer.set_byte(2, 0xC);
+        app.buffer.set_byte(3, 0xD);
+        execute_command(&mut app, &format!("diff {}", path.display())).unwrap();
+        assert_eq!(app.diff.as_ref().unwrap().runs, vec![(5, 2)], "已改一致的字节应移出差异列表");
+
+        // 无参清除
+        execute_command(&mut app, "diff").unwrap();
+        assert!(app.diff.is_none());
+        assert!(app.message.as_ref().unwrap().0.contains("cleared"));
+
+        // 长度不同：比对共同前缀并注明
+        std::fs::write(&path, &[1, 2, 0xC]).unwrap();
+        execute_command(&mut app, &format!("diff {}", path.display())).unwrap();
+        assert!(app.message.as_ref().unwrap().0.contains("lengths differ"));
+        assert_eq!(app.diff.as_ref().unwrap().runs.len(), 0);
+
+        // 不存在文件报错
+        let err = execute_command(&mut app, "diff /nonexistent/file.bin").unwrap_err();
+        assert!(err.to_string().contains("Failed to read"), "实际: {}", err);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// :w 范围支持书签引用 'a（空格分隔与 vim 逗号连写），未设置报错，可与 +L 混用
+    #[test]
+    fn write_range_with_mark_references() {
+        let path = tmp_w_path("markref");
+        let mut app = app_with_data(&[0xA, 0xB, 0xC, 0xD, 0xE, 0xF]);
+        app.marks[0] = Some(1); // 'a = 0xB
+        app.marks[1] = Some(4); // 'b = 0xE
+
+        execute_command(&mut app, &format!("w {} 'a 'b", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xB, 0xC, 0xD, 0xE]);
+
+        // 逗号连写 'a,'b 等价
+        execute_command(&mut app, &format!("w! {} 'a,'b", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xB, 0xC, 0xD, 0xE]);
+
+        // 书签起点 + 相对长度
+        execute_command(&mut app, &format!("w! {} 'a +L2", path.display())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xB, 0xC]);
+
+        // 未设置的 mark 报错
+        let err = execute_command(&mut app, &format!("w! {} 'z 'b", path.display())).unwrap_err();
+        assert!(err.to_string().contains("Mark not set"), "实际: {}", err);
         std::fs::remove_file(&path).ok();
     }
 }

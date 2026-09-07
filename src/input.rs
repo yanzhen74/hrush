@@ -12,6 +12,22 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 宏录制：捕获所有按键（停止录制的 q 除外）；回放展开的键也会被捕获（与 vim 一致）
+    if app.macro_recording.is_some() {
+        let stop_recording = app.mode == Mode::Normal
+            && app.pending_key.is_none()
+            && key.code == KeyCode::Char('q')
+            && !key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !app.match_list_open && !app.type_panel_open && !app.sum_open;
+        if stop_recording {
+            stop_macro_recording(app);
+            return Ok(());
+        }
+        if let Some((_, keys)) = app.macro_recording.as_mut() {
+            keys.push(key.clone());
+        }
+    }
+
     // 优先处理待定键（Normal 模式的多键序列）
     if app.mode == Mode::Normal && app.pending_key.is_some() {
         handle_pending_key(app, key);
@@ -87,7 +103,161 @@ fn handle_pending_key(app: &mut App, key: KeyEvent) {
         'r' => {
             handle_single_replace(app, key);
         }
+        'm' => {
+            // 设置书签 m[a-z]；无效寄存器字符仅提示
+            if let KeyCode::Char(c @ 'a'..='z') = key.code {
+                let idx = (c as u8 - b'a') as usize;
+                app.marks[idx] = Some(app.cursor_offset);
+                app.message = Some((
+                    format!("Mark {} set at 0x{:X}", c, app.cursor_offset),
+                    std::time::Instant::now(),
+                ));
+            } else {
+                app.message = Some(("Mark register must be a-z".to_string(), std::time::Instant::now()));
+            }
+        }
+        '`' => {
+            // 跳转书签 `[a-z]（' 同样绑定：hex 无行首语义，精确跳转到字节）
+            if let KeyCode::Char(c @ 'a'..='z') = key.code {
+                let idx = (c as u8 - b'a') as usize;
+                match app.marks[idx] {
+                    Some(pos) => {
+                        // 文件编辑后标记可能越界，钳到末尾（与 `.` 命令 EOF 钳制惯例一致）
+                        let pos = if app.buffer.is_empty() { 0 } else { pos.min(app.buffer.len() - 1) };
+                        if pos != app.cursor_offset {
+                            app.push_jump();
+                        }
+                        app.cursor_offset = pos;
+                    }
+                    None => {
+                        app.message = Some((
+                            format!("Mark not set: {}", c),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+            } else {
+                app.message = Some(("Mark register must be a-z".to_string(), std::time::Instant::now()));
+            }
+        }
+        'q' => {
+            // 开始录制 q[a-z]（停止录制在 handle_input 顶层处理，q 自身不入宏）
+            if let KeyCode::Char(c @ 'a'..='z') = key.code {
+                app.macro_recording = Some((c, Vec::new()));
+                app.message = Some((
+                    format!("Recording macro @{} (press q to stop)", c),
+                    std::time::Instant::now(),
+                ));
+            } else {
+                app.message = Some(("Macro register must be a-z".to_string(), std::time::Instant::now()));
+            }
+        }
+        '@' => {
+            // 回放 @<reg>，@@ 重复上次；支持 count 前缀（3@a）
+            if let KeyCode::Char(c @ 'a'..='z') = key.code {
+                play_macro(app, c);
+            } else if key.code == KeyCode::Char('@') {
+                match app.macro_last {
+                    Some(reg) => play_macro(app, reg),
+                    None => {
+                        app.message = Some(("No macro played yet".to_string(), std::time::Instant::now()));
+                    }
+                }
+            } else {
+                app.message = Some(("Macro register must be a-z".to_string(), std::time::Instant::now()));
+            }
+        }
         _ => {}
+    }
+}
+
+/// 停止录制并保存宏（空序列不保存，与 vim 一致）
+fn stop_macro_recording(app: &mut App) {
+    if let Some((reg, keys)) = app.macro_recording.take() {
+        if keys.is_empty() {
+            app.message = Some((
+                format!("Empty macro @{} discarded", reg),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        let count = keys.len();
+        app.macro_registers.insert(reg, keys);
+        app.message = Some((
+            format!("Recorded {} keys into @{}", count, reg),
+            std::time::Instant::now(),
+        ));
+    }
+}
+
+/// 回放宏：同步逐键送入 handle_input；异步搜索等待完成并应用跳转（与交互语义一致）；
+/// 嵌套深度限制 8 层（宏内含 @自身时无限递归防护）
+pub fn play_macro(app: &mut App, reg: char) {
+    if app.macro_depth >= 8 {
+        app.message = Some(("Macro nesting too deep, aborted".to_string(), std::time::Instant::now()));
+        return;
+    }
+    let keys = match app.macro_registers.get(&reg).cloned() {
+        Some(k) => k,
+        None => {
+            app.message = Some((
+                format!("No macro recorded in @{}", reg),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+    };
+    app.macro_last = Some(reg);
+    let count = app.count_prefix.take().unwrap_or(1).min(1000);
+    app.macro_depth += 1;
+    'outer: for _ in 0..count {
+        for k in &keys {
+            let _ = handle_input(app, k.clone());
+            // 等待异步搜索完成（上限 10s 防死锁），完成后执行与主循环相同的自动跳转
+            let mut waited = 0u32;
+            while app.is_searching() && waited < 2000 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                app.apply_search_result();
+                waited += 1;
+            }
+            if !app.running {
+                break 'outer;
+            }
+        }
+    }
+    app.macro_depth -= 1;
+}
+
+/// diff 导航：`]` 下一个差异段 / `[` 上一个（环绕）；跳转到段首并更新 current 索引
+fn diff_jump(app: &mut App, forward: bool) {
+    // 先在不可变借用下算出目标，再释放借用修改状态
+    let target = match &app.diff {
+        None => {
+            app.message = Some(("No active diff (use :diff <path>)".to_string(), std::time::Instant::now()));
+            return;
+        }
+        Some(diff) if diff.runs.is_empty() => {
+            app.message = Some(("No differences".to_string(), std::time::Instant::now()));
+            return;
+        }
+        Some(diff) => {
+            let idx = if forward {
+                diff.runs.iter().position(|&(s, _)| s > app.cursor_offset)
+                    .unwrap_or(0)
+            } else {
+                diff.runs.iter().rposition(|&(s, _)| s < app.cursor_offset)
+                    .unwrap_or(diff.runs.len() - 1)
+            };
+            (idx, diff.runs[idx].0)
+        }
+    };
+    let (idx, pos) = target;
+    if pos != app.cursor_offset {
+        app.push_jump();
+    }
+    app.cursor_offset = pos;
+    if let Some(diff) = &mut app.diff {
+        diff.current = Some(idx);
     }
 }
 
@@ -175,10 +345,35 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('d') => {
             app.pending_key = Some('d');
+            // 保留 count 前缀供 Ndd（尾部统一清理会吞掉它）
+            return;
         }
         KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.pending_key = Some('r');
             app.nibble_input = None;
+        }
+        // 书签：m<reg> 设置，`<reg>/'<reg> 跳转
+        KeyCode::Char('m') => {
+            app.pending_key = Some('m');
+        }
+        KeyCode::Char('`') | KeyCode::Char('\'') => {
+            app.pending_key = Some('`');
+        }
+        // 宏：q<reg> 录制（录制中再按 q 停止，在 handle_input 顶层处理），@<reg> 回放
+        KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.pending_key = Some('q');
+        }
+        KeyCode::Char('@') => {
+            app.pending_key = Some('@');
+            // 保留 count 前缀供 N@reg 重复回放（尾部统一清理会吞掉它）
+            return;
+        }
+        // diff 导航：`]` 下一差异段 / `[` 上一差异段
+        KeyCode::Char(']') => {
+            diff_jump(app, true);
+        }
+        KeyCode::Char('[') => {
+            diff_jump(app, false);
         }
 
         // 帮助模式入口
@@ -3118,6 +3313,163 @@ mod tests {
         app.yank_buffer = YankBuffer::Block(vec![vec![0xFF]]);
         app.cursor_offset = 0;
         let _ = handle_input(&mut app, ctrl_p()); // 不应 panic
+    }
+
+    /// count 前缀 + dd：3dd 删除 3 行（pending 设置时不得吞掉 count）
+    #[test]
+    fn count_prefix_dd_deletes_three_lines() {
+        let mut app = app_with_data(&[0u8; 64]);
+        for k in ['3', 'd', 'd'] {
+            handle_input(&mut app, key(k)).unwrap();
+        }
+        assert_eq!(app.buffer.len(), 16, "3dd 应删除 3×16 字节");
+    }
+
+    /// 书签：m<reg> 设置、`<reg>/'<reg> 跳转（含 jumplist 入栈）、未设置提示、越界钳到 EOF
+    #[test]
+    fn marks_set_jump_and_clamp() {
+        let mut app = app_with_data(&[0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x10, 0x11]);
+        app.cursor_offset = 5;
+        handle_input(&mut app, key('m')).unwrap();
+        handle_input(&mut app, key('a')).unwrap();
+        assert_eq!(app.marks[0], Some(5));
+
+        // 跳到别处后 `a 跳回，jumplist 记录原位置
+        app.cursor_offset = 1;
+        handle_input(&mut app, key('`')).unwrap();
+        handle_input(&mut app, key('a')).unwrap();
+        assert_eq!(app.cursor_offset, 5);
+        assert_eq!(app.jump_back.last(), Some(&1));
+
+        // 'a 与 `a 等价（hex 无行首语义）
+        app.cursor_offset = 0;
+        handle_input(&mut app, key('\'')).unwrap();
+        handle_input(&mut app, key('a')).unwrap();
+        assert_eq!(app.cursor_offset, 5);
+
+        // 未设置的 mark 提示
+        handle_input(&mut app, key('`')).unwrap();
+        handle_input(&mut app, key('z')).unwrap();
+        assert!(app.message.as_ref().unwrap().0.contains("Mark not set"));
+
+        // 文件编辑后越界 mark 钳到末尾
+        app.marks[1] = Some(100);
+        handle_input(&mut app, key('`')).unwrap();
+        handle_input(&mut app, key('b')).unwrap();
+        assert_eq!(app.cursor_offset, 7);
+
+        // 无效寄存器字符提示
+        handle_input(&mut app, key('m')).unwrap();
+        handle_input(&mut app, key('1')).unwrap();
+        assert!(app.message.as_ref().unwrap().0.contains("a-z"));
+    }
+
+    /// 宏：qa 录制 lll、q 停止（q/a 自身不入宏）；@a 回放、@@ 重复、count 前缀 3@a；
+    /// 空宏丢弃；未录制寄存器提示
+    #[test]
+    fn macro_record_play_repeat_and_count() {
+        let mut app = app_with_data(&[0u8; 64]);
+        for k in ['q', 'a', 'l', 'l', 'l', 'q'] {
+            handle_input(&mut app, key(k)).unwrap();
+        }
+        assert!(app.macro_recording.is_none());
+        assert_eq!(app.macro_registers.get(&'a').map(|v| v.len()), Some(3));
+        // 录制的键同时被执行：光标已右移 3
+        assert_eq!(app.cursor_offset, 3);
+        // 宏内容不含 q/a 自身
+        assert!(app.macro_registers[&'a'].iter().all(|k| k.code == KeyCode::Char('l')));
+
+        // @a 回放：从 3 再 +3
+        handle_input(&mut app, key('@')).unwrap();
+        handle_input(&mut app, key('a')).unwrap();
+        assert_eq!(app.cursor_offset, 6);
+        // @@ 重复上次
+        handle_input(&mut app, key('@')).unwrap();
+        handle_input(&mut app, key('@')).unwrap();
+        assert_eq!(app.cursor_offset, 9);
+        // 3@a：count 前缀回放 3 次
+        for k in ['3', '@', 'a'] {
+            handle_input(&mut app, key(k)).unwrap();
+        }
+        assert_eq!(app.cursor_offset, 18);
+
+        // 空宏丢弃
+        for k in ['q', 'b', 'q'] {
+            handle_input(&mut app, key(k)).unwrap();
+        }
+        assert!(!app.macro_registers.contains_key(&'b'));
+        assert!(app.message.as_ref().unwrap().0.contains("Empty macro"));
+
+        // 未录制寄存器提示
+        handle_input(&mut app, key('@')).unwrap();
+        handle_input(&mut app, key('z')).unwrap();
+        assert!(app.message.as_ref().unwrap().0.contains("No macro recorded"));
+    }
+
+    /// 含编辑的宏：录制 x l x（录制中同步执行），撤销后回放重现删除效果
+    #[test]
+    fn macro_with_edit_replays_and_undoes() {
+        let mut app = app_with_data(&[1, 2, 3, 4, 5]);
+        for k in ['q', 'a', 'x', 'l', 'x', 'q'] {
+            handle_input(&mut app, key(k)).unwrap();
+        }
+        // 录制时按键同时执行：已删除 1 和 3
+        assert_eq!(&app.buffer.get_range(0, app.buffer.len())[..], &[2, 4, 5]);
+
+        // undo 两次回到原始数据
+        handle_input(&mut app, key('u')).unwrap();
+        handle_input(&mut app, key('u')).unwrap();
+        assert_eq!(&app.buffer.get_range(0, app.buffer.len())[..], &[1, 2, 3, 4, 5]);
+
+        // 回放重现删除
+        app.cursor_offset = 0;
+        handle_input(&mut app, key('@')).unwrap();
+        handle_input(&mut app, key('a')).unwrap();
+        assert_eq!(&app.buffer.get_range(0, app.buffer.len())[..], &[2, 4, 5]);
+    }
+
+    /// 嵌套防护：宏 @a 内容为 @a 自身时，回放在深度限制处中止，不栈溢出且深度归零
+    #[test]
+    fn macro_nesting_depth_guard() {
+        let mut app = app_with_data(&[0u8; 64]);
+        for k in ['q', 'a', '@', 'a', 'q'] {
+            handle_input(&mut app, key(k)).unwrap();
+        }
+        assert_eq!(app.macro_registers.get(&'a').map(|v| v.len()), Some(2));
+        handle_input(&mut app, key('@')).unwrap();
+        handle_input(&mut app, key('a')).unwrap();
+        assert_eq!(app.macro_depth, 0, "回放结束后深度应归零");
+        assert!(app.message.as_ref().unwrap().0.contains("nesting too deep"));
+    }
+
+    /// diff 导航：`]` 下一差异段 / `[` 上一段（环绕），无 diff 提示，跳转压 jumplist
+    #[test]
+    fn diff_navigation_brackets() {
+        let mut app = app_with_data(&[0u8; 64]);
+        handle_input(&mut app, key(']')).unwrap();
+        assert!(app.message.as_ref().unwrap().0.contains("No active diff"));
+
+        app.diff = Some(crate::app::DiffState {
+            path: "other.bin".to_string(),
+            runs: vec![(4, 2), (16, 1), (32, 4)],
+            total_bytes: 7,
+            current: None,
+        });
+        app.cursor_offset = 0;
+        handle_input(&mut app, key(']')).unwrap();
+        assert_eq!(app.cursor_offset, 4);
+        assert_eq!(app.diff.as_ref().unwrap().current, Some(0));
+        handle_input(&mut app, key(']')).unwrap();
+        assert_eq!(app.cursor_offset, 16);
+
+        // 末尾之后 ] 环绕到第一段
+        app.cursor_offset = 32;
+        handle_input(&mut app, key(']')).unwrap();
+        assert_eq!(app.cursor_offset, 4);
+        // 首段之前 [ 环绕到末段
+        handle_input(&mut app, key('[')).unwrap();
+        assert_eq!(app.cursor_offset, 32);
+        assert!(!app.jump_back.is_empty(), "diff 跳转应压 jumplist");
     }
 }
 

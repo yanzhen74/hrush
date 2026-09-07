@@ -57,6 +57,23 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // diff 比对指示：当前差异段/总段数/差异字节数
+    if let Some(diff) = &app.diff {
+        let cur = diff.current.map(|i| format!("{}/", i + 1)).unwrap_or_default();
+        spans.push(Span::styled(
+            format!(" [DIFF {}{} {}B]", cur, diff.runs.len(), diff.total_bytes),
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    // 宏录制中指示
+    if let Some((reg, _)) = app.macro_recording {
+        spans.push(Span::styled(
+            format!(" REC @{}", reg),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if app.is_searching() {
         let progress = app.search_state.progress.lock().unwrap();
         let pct = if progress.total > 0 {

@@ -46,6 +46,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             &app.search_state,
             app.selection_range(),
             app.block_rect(),
+            app.diff.as_ref(),
         );
     }
 

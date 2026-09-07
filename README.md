@@ -24,7 +24,10 @@
 - **Block (Rectangular) Editing** — Yank/cut/paste rectangular blocks; `p` pastes a block row-by-row at the cursor, `Ctrl+P` (or `:overpaste`) overwrites without growing the file. In block mode, `i`/`a` insert/append the typed bytes across every selected row, undone as a single change.
 - **Checksums** — Compute `:sum8/:sum16/:sum32`, `:crc16` (configurable poly/init/refin/refout/xorout), `:crc32`, `:md5`, `:sha256` over the selection or the whole file.
 - **Repeat Last Change** — `.` repeats the last edit (supports count prefix, e.g., `3.`).
-- **Range Extraction** — Save a slice to a new file: Visual selection then `:w out.bin`, or explicit ranges like `:w out.bin 0x1000 0x2000`, `:w out.bin +L256` (from cursor), `:w out.bin 0x2000 +0xA0`, `:w out.bin $` (cursor to EOF). Existing targets are refused unless `:w!` is used, and the message states exactly which part would be written.
+- **Range Extraction** — Save a slice to a new file: Visual selection then `:w out.bin`, or explicit ranges like `:w out.bin 0x1000 0x2000`, `:w out.bin +L256` (from cursor), `:w out.bin 0x2000 +0xA0`, `:w out.bin $` (cursor to EOF), `:w out.bin 'a 'b` (bookmark refs, also `'a,'b`). Existing targets are refused unless `:w!` is used, and the message states exactly which part would be written.
+- **Bookmarks** — `ma`…`mz` set bookmarks, `` `a ``/`'a` jump back (jumplist-integrated, EOF-clamped after edits); `:marks` lists them, `:delmarks a` / `:delmarks!` removes them.
+- **Macro Recording** — `qa`…`qz` record a key sequence into a register (keys execute while recorded), `q` stops; `@a` plays it back, `@@` repeats the last macro, `3@a` plays it three times. Async searches inside a macro are awaited so playback matches interactive behavior.
+- **File Diff** — `:diff other.bin` byte-compares the buffer with another file: differing bytes are highlighted, `]`/`[` jump between diff regions (wrapping), and the status bar shows region progress. In frame mode, frames containing differences are marked with a red `!` in the row header. Length mismatches are compared over the common prefix and noted. Run `:diff` again to clear.
 - **Built-in Help System** — Press `?` or `F1` for full-screen help with all keybindings and commands. Use `:help [topic]` to jump to specific topics. Status bar displays the current mode with color-coded indicators.
 
 ## Large-File Mode

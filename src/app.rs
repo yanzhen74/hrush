@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyEvent};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
@@ -64,6 +64,42 @@ pub struct BlockInsertCtx {
     pub insert_left: bool,
 }
 
+/// `:diff <path>` 建立的差异比对状态（阶段一：单缓冲 + 差异区间列表）。
+/// runs 为升序不重叠的 (start, len) 差异段快照，建立后不随编辑更新。
+pub struct DiffState {
+    pub path: String,
+    pub runs: Vec<(usize, usize)>,
+    pub total_bytes: usize,
+    /// 当前导航所在的 run 索引（`[`/`]` 跳转时更新）
+    pub current: Option<usize>,
+}
+
+impl DiffState {
+    /// 二分判断偏移是否落在差异段内（供渲染层 O(log n) 高亮判定）
+    pub fn contains(&self, offset: usize) -> bool {
+        // 找最后一个 start <= offset 的 run，再判 offset < start + len
+        match self.runs.binary_search_by(|&(s, _)| s.cmp(&offset)) {
+            Ok(_) => true,
+            Err(0) => false,
+            Err(i) => {
+                let (s, l) = self.runs[i - 1];
+                offset < s + l
+            }
+        }
+    }
+
+    /// 判断区间 [start, start+len) 是否与差异段相交（帧行头标记用，O(log n)）
+    pub fn intersects(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = start + len;
+        // 第一个结束位置 > start 的 run，若其起点 < end 则相交
+        let idx = self.runs.partition_point(|&(s, l)| s + l <= start);
+        self.runs.get(idx).map_or(false, |&(s, _)| s < end)
+    }
+}
+
 pub struct App {
     pub running: bool,
     pub mode: Mode,
@@ -110,6 +146,18 @@ pub struct App {
     pub block_insert_ctx: Option<BlockInsertCtx>,
     /// Block 模式进入 Command 时暂存的逐段选区（:fill/:set/校验和优先使用）
     pub pending_segments: Option<Vec<(usize, usize)>>,
+    /// 书签 a-z（m<reg> 设置，`<reg>/'<reg> 跳转）
+    pub marks: [Option<usize>; 26],
+    /// 宏寄存器：q<reg> 录制的按键序列，@<reg> 回放
+    pub macro_registers: std::collections::HashMap<char, Vec<KeyEvent>>,
+    /// 录制中的宏：(寄存器, 已捕获按键)；录制状态下每个按键在 handle_input 顶层被捕获
+    pub macro_recording: Option<(char, Vec<KeyEvent>)>,
+    /// 最近一次回放的寄存器（@@ 重复）
+    pub macro_last: Option<char>,
+    /// 回放嵌套深度（宏内 @ 触发，防无限递归）
+    pub macro_depth: usize,
+    /// 活动 diff 比对状态（:diff <path> 建立，:diff 清除）
+    pub diff: Option<DiffState>,
 }
 
 impl App {
@@ -159,6 +207,12 @@ impl App {
             match_list_scroll: 0,
             block_insert_ctx: None,
             pending_segments: None,
+            marks: [None; 26],
+            macro_registers: std::collections::HashMap::new(),
+            macro_recording: None,
+            macro_last: None,
+            macro_depth: 0,
+            diff: None,
         }
     }
 
@@ -320,20 +374,7 @@ impl App {
             }
 
             // 检查异步搜索是否完成（收集结果后刷新打开中的匹配列表）
-            if self.poll_search_result() {
-                // 搜索完成，自动跳转到第一个匹配（跳转前记录原位置到 jumplist）
-                if let Some(offset) = self.search_state.first_match() {
-                    if offset != self.cursor_offset {
-                        self.push_jump();
-                    }
-                    self.cursor_offset = offset;
-                } else if !self.search_state.matches.is_empty() {
-                    if let Some(offset) = self.search_state.next_match(self.cursor_offset) {
-                        self.push_jump();
-                        self.cursor_offset = offset;
-                    }
-                }
-            }
+            self.apply_search_result();
             
             terminal.draw(|frame| ui::draw(frame, self))?;
             self.handle_events()?;
@@ -397,6 +438,24 @@ impl App {
             true
         } else {
             false
+        }
+    }
+
+    /// 检查异步搜索完成并执行自动跳转（主循环与宏回放共用，保证回放中搜索语义与交互一致）
+    pub fn apply_search_result(&mut self) {
+        if self.poll_search_result() {
+            // 搜索完成，自动跳转到第一个匹配（跳转前记录原位置到 jumplist）
+            if let Some(offset) = self.search_state.first_match() {
+                if offset != self.cursor_offset {
+                    self.push_jump();
+                }
+                self.cursor_offset = offset;
+            } else if !self.search_state.matches.is_empty() {
+                if let Some(offset) = self.search_state.next_match(self.cursor_offset) {
+                    self.push_jump();
+                    self.cursor_offset = offset;
+                }
+            }
         }
     }
 
